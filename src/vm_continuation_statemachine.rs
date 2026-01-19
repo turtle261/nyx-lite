@@ -147,13 +147,13 @@ impl VMContinuationState{
                 return (Self::Main, Some(VMExitUserEvent::BadMemoryAccess))
             }
             UnparsedExitReason::GuestBreakpoint => {
-                panic!("We shouild never see a breakpoint based vm exit while injecting breakpoints interrupts");
+                panic!("We should never see a breakpoint based vm exit while injecting breakpoints interrupts");
             }
             UnparsedExitReason::NyxBreakpoint => {
-                panic!("We shouild never see a breakpoint based vm exit while injecting breakpoints interrupts");
+                panic!("We should never see a breakpoint based vm exit while injecting breakpoints interrupts");
             }
             UnparsedExitReason::Hypercall => {
-                panic!("We shouild never see a breakpoint based vm exit while injecting breakpoints interrupts");
+                panic!("We should never see a breakpoint based vm exit while injecting breakpoints interrupts");
             }
             UnparsedExitReason::Interrupted => return (Self::ForceSingleStepInjectBPs, None),
             UnparsedExitReason::Shutdown => return (Self::Main, Some(VMExitUserEvent::Shutdown)),
