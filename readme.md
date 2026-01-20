@@ -92,13 +92,15 @@ To get a sense of how to use
 
 ```
 
+If `serial_out_path` is not configured, NyxVM will create a PTY and wire the guest serial console to its slave. The PTY master is exposed via `NyxVM.serial_pty` so callers can capture output without touching stdout.
+
 Caveats 
 =======
 Nyx-Lite is currently not a stable release - there's quite a few limitations and known issues:
 1) Performance: The rust wrapper around KVM currently only exposes the dirty bitmap and not the dirty_ring interface, and as such incremental snapshot reset performance for large VM's can be dominate by the time to walk the bitmap (This is planned to change in the future) - ditto for the firecracker host side dirty memory tracking.
 2) Performance: We currently don't allow to share root snapshots between different VM instances, and it's unclear if it's safe to make more than one VM instance per process. This limits usefullness in highly parallel settings (This is planned to change in the future)
 3) Performance: Using lots of software breakpoints will make VM Entry/Exits slow as we remove/reapply all breakpoints to allow a clean view at the memory. This should be fixed by hiding breakpoints from memory accesses to allow to use millions of breakpoints with acceptable performance.
-6) TTY emulation is currently semi-broken. Unfortunately rust doesn't handle nonblocking stdout, and firecracker set's stdin/stdout to nonblocking to allow it's async device emulation to handle a tty. This will crash the application whenever you try to print large amounts of data. As such, we currently disable stdin to the TTY to enable (printf) debugging (this is planned to change in the near future). 
+6) Serial output now defaults to a PTY slave when `serial_out_path` is unset; callers should read from `NyxVM.serial_pty` if they need console output. 
 5) Determinism: While using snapshots generally leads to somewhat deterministic behavior, KVM doesn't allow to make a fully deterministic VMM. In addition to not being able to easily control timing interrupts ourselfs, we can also not precisely control the value of tsc when resetting the snapshot, as KVM "helpfully" tries to account for time spend in the host, and will introduce jitter based on how long the host takes to reenter the VM. As such multithreading/highly timing sensitive applications might not behave deterministically.
 6) Network devices are currently not supported when using snapshots. While you can boot the VM with a network device to perform a setup, they won't work in snapshot, likely resulting in crashes. Ideally, we'd like to allow real world network traffic during execution, and replay it after running a snapshot.\
 7) A variety of known bugs and issues that will get fixed as we find time to address them. 

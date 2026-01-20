@@ -1,4 +1,7 @@
-use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, InstructionInfoFactory, NasmFormatter};
+use iced_x86::{
+    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, InstructionInfoFactory,
+    NasmFormatter,
+};
 pub use iced_x86::OpAccess;
 const HEXBYTES_COLUMN_BYTE_LENGTH: usize = 10;
 
@@ -66,6 +69,7 @@ use kvm_bindings::{kvm_regs, kvm_sregs};
 
 fn get_register_value(reg: Register, regs: &kvm_regs, sregs: &kvm_sregs) -> u64 {
     match reg {
+        Register::None => 0,
         // 64-bit general purpose registers
         Register::RAX => regs.rax,
         Register::RBX => regs.rbx,
@@ -102,6 +106,7 @@ fn get_register_value(reg: Register, regs: &kvm_regs, sregs: &kvm_sregs) -> u64 
         Register::R13D => regs.r13 as u32 as u64,
         Register::R14D => regs.r14 as u32 as u64,
         Register::R15D => regs.r15 as u32 as u64,
+        Register::EIP => regs.rip as u32 as u64,
 
         // 16-bit variants
         Register::AX => (regs.rax & 0xFFFF) as u64,
@@ -144,7 +149,6 @@ fn get_register_value(reg: Register, regs: &kvm_regs, sregs: &kvm_sregs) -> u64 
         Register::BH => ((regs.rbx >> 8) & 0xFF) as u64,
         Register::CH => ((regs.rcx >> 8) & 0xFF) as u64,
         Register::DH => ((regs.rdx >> 8) & 0xFF) as u64,
-
         // Segment registers
         Register::CS => sregs.cs.base,
         Register::DS => sregs.ds.base,
@@ -162,18 +166,32 @@ fn get_register_value(reg: Register, regs: &kvm_regs, sregs: &kvm_sregs) -> u64 
 pub fn get_memory_accesses(instr: &Instruction, regs: &kvm_regs, sregs: &kvm_sregs) -> Vec<(u64, OpAccess)> {
     let mut factory = InstructionInfoFactory::new();
     let info = factory.info(instr);
-    info.used_memory()
-        .iter()
-        .map(|mem| {
-            let base = get_register_value(mem.base(), regs, sregs);
-            let index = get_register_value(mem.index(), regs, sregs);
-            let scale = mem.scale() as u64;
-            let displacement = mem.displacement() as u64;
-            
-            let addr = base + (index * scale) + displacement;
-            (addr, mem.access())
-        })
-        .collect()
+    let page_size = crate::mem::PAGE_SIZE;
+    let page_mask = !(page_size - 1);
+    let mut accesses = Vec::new();
+    for mem in info.used_memory().iter() {
+        let base = get_register_value(mem.base(), regs, sregs) as i128;
+        let index = get_register_value(mem.index(), regs, sregs) as i128;
+        let scale = mem.scale() as i128;
+        let displacement = mem.displacement() as i128;
+        let segment = get_register_value(mem.segment(), regs, sregs) as i128;
+
+        let addr = (segment + base + (index * scale) + displacement) as u64;
+        let access = mem.access();
+        accesses.push((addr, access));
+
+        let size_bytes = mem.memory_size().size();
+        if size_bytes == 0 {
+            continue;
+        }
+        let end = addr.saturating_add(size_bytes as u64 - 1);
+        let mut next_page = (addr & page_mask).saturating_add(page_size);
+        while next_page <= end {
+            accesses.push((next_page, access));
+            next_page = next_page.saturating_add(page_size);
+        }
+    }
+    accesses
 }
 
 pub fn disassemble_memory_accesses(data: &[u8], regs: &kvm_regs, sregs: &kvm_sregs) -> Vec<(u64, OpAccess)> {
@@ -185,4 +203,14 @@ pub fn disassemble_memory_accesses(data: &[u8], regs: &kvm_regs, sregs: &kvm_sre
         return vec![]; 
     }
     return get_memory_accesses(&instruction, regs, sregs)
+}
+
+pub fn is_control_flow(addr: u64, bytes: &[u8]) -> bool {
+    let mut decoder = Decoder::with_ip(64, bytes, addr, DecoderOptions::NONE);
+    let mut instruction = Instruction::default();
+    if !decoder.can_decode() {
+        return false;
+    }
+    decoder.decode_out(&mut instruction);
+    !matches!(instruction.flow_control(), FlowControl::Next)
 }

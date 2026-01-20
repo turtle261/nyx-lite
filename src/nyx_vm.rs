@@ -1,6 +1,11 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use std::fs::File;
+use std::path::PathBuf;
+use std::os::unix::io::FromRawFd;
 use std::sync::{Arc, Mutex};
+use std::ffi::CStr;
 use std::thread::JoinHandle;
 use std::time::{self, Duration};
 use std::thread;
@@ -9,26 +14,30 @@ use anyhow::Result;
 
 use event_manager::SubscriberOps;
 use iced_x86::OpAccess;
-use vmm::arch::{DeviceType, PAGE_SIZE};
-use vmm::arch_gen::x86::msr_index::{MSR_IA32_DEBUGCTLMSR, MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST};
+use vmm::arch::GUEST_PAGE_SIZE;
+use vmm::arch::x86_64::generated::msr_index::{
+    MSR_IA32_DEBUGCTLMSR, MSR_IA32_TSC, MSR_IA32_TSC_ADJUST, MSR_IA32_TSC_DEADLINE,
+};
 use vmm::device_manager::mmio::MMIODeviceManager;
 use vmm::devices::virtio::block::device::Block;
 use vmm::devices::virtio::block::persist::BlockState;
 use vmm::devices::virtio::queue::Queue;
-use vmm::devices::virtio::TYPE_BLOCK;
+use vmm::devices::virtio::persist::QueueConstructorArgs;
+use vmm::devices::virtio::generated::virtio_ids::VIRTIO_ID_BLOCK;
+use vmm::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vmm::logger::debug;
 use vmm::persist::MicrovmState;
 use vmm::resources::VmResources;
 use vmm::snapshot::Persist;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
-use vmm::vstate::memory::{GuestMemoryExtension, GuestRegionMmap};
+use vmm::vstate::memory::{GuestMemoryExtension, GuestRegionMmapExt};
 use vmm::vstate::memory::{
     Bitmap, Bytes, GuestAddress, GuestMemory, GuestMemoryRegion, MemoryRegionAddress,
 };
-use vmm::vstate::vcpu::{VcpuEmulation, VcpuError};
+use vmm::vstate::vcpu::{VcpuEmulation, VcpuError, VCPU_RTSIG_OFFSET};
 use vmm::Vcpu;
 use vmm::Vmm;
-use vmm::{EventManager, FcExitCode, VcpuEvent};
+use vmm::{EventManager, VcpuEvent};
 
 use kvm_bindings::{kvm_guest_debug_arch, kvm_msr_entry, kvm_regs, kvm_sregs, Msrs, KVM_GUESTDBG_BLOCKIRQ, KVM_GUESTDBG_INJECT_BP, KVM_GUESTDBG_USE_HW_BP};
 use kvm_bindings::kvm_guest_debug;
@@ -37,7 +46,7 @@ use kvm_bindings::KVM_GUESTDBG_USE_SW_BP;
 use kvm_bindings::KVM_GUESTDBG_SINGLESTEP;
 
 use crate::breakpoints::{BreakpointManager, BreakpointManagerTrait};
-use crate::disassembly::disassemble_memory_accesses;
+use crate::disassembly::{disassemble_memory_accesses, is_control_flow};
 use crate::firecracker_wrappers::build_microvm_for_boot;
 use crate::hw_breakpoints::HwBreakpoints;
 use crate::snapshot::{MemorySnapshot, NyxSnapshot, SnapshotType};
@@ -67,6 +76,7 @@ pub struct NyxVM {
     pub vmm: Arc<Mutex<Vmm>>,
     pub vcpu: Vcpu,
     pub event_thread_handle: JoinHandle<Result<(), anyhow::Error>>,
+    event_manager: RefCell<EventManager>,
     pub vm_resources: VmResources,
     pub block_devices: Vec<Arc<Mutex<Block>>>,
     pub timeout_timer: Arc<Mutex<TimerEvent>>,
@@ -74,6 +84,58 @@ pub struct NyxVM {
     pub breakpoint_manager: Box<dyn BreakpointManagerTrait>,
     pub hw_breakpoints: HwBreakpoints,
     pub active_snapshot: Option<Arc<NyxSnapshot>>,
+    pub serial_pty: Option<SerialPty>,
+    regs_cache: RefCell<Option<kvm_regs>>,
+    sregs_cache: RefCell<Option<kvm_sregs>>,
+    last_nyx_breakpoint: RefCell<Option<(u64, u64)>>,
+}
+
+#[derive(Debug)]
+pub struct SerialPty {
+    pub master: File,
+    pub slave_path: PathBuf,
+}
+
+fn create_serial_pty() -> std::io::Result<SerialPty> {
+    let mut master: libc::c_int = 0;
+    let mut slave: libc::c_int = 0;
+    let mut name = [0 as libc::c_char; 128];
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            name.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let slave_path = unsafe { CStr::from_ptr(name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { libc::close(slave) };
+    let master_file = unsafe { File::from_raw_fd(master) };
+    Ok(SerialPty {
+        master: master_file,
+        slave_path: PathBuf::from(slave_path),
+    })
+}
+
+fn register_kick_signal_handler() {
+    extern "C" fn handle_signal(
+        _: libc::c_int,
+        _: *mut libc::siginfo_t,
+        _: *mut libc::c_void,
+    ) {
+        std::sync::atomic::fence(Ordering::Acquire);
+    }
+    vmm::utils::signal::register_signal_handler(
+        vmm::utils::signal::sigrtmin() + VCPU_RTSIG_OFFSET,
+        handle_signal,
+    )
+    .expect("Failed to register vcpu signal handler");
 }
 
 
@@ -126,6 +188,13 @@ impl NyxVM {
         let mut vm_resources =
             VmResources::from_json(&config_json, &instance_info, mmds_size_limit, None)
                 .expect("couldn't parse config json");
+        let mut serial_pty = None;
+        if vm_resources.serial_out_path.is_none() {
+            if let Ok(pty) = create_serial_pty() {
+                vm_resources.serial_out_path = Some(pty.slave_path.clone());
+                serial_pty = Some(pty);
+            }
+        }
 
         let block_devices = vm_resources
             .block
@@ -134,7 +203,7 @@ impl NyxVM {
             .cloned()
             .collect::<Vec<_>>();
 
-        vm_resources.vm_config.track_dirty_pages = true;
+        vm_resources.machine_config.track_dirty_pages = true;
 
         vm_resources.boot_timer = false;
 
@@ -147,34 +216,16 @@ impl NyxVM {
         let timeout_timer = Arc::new(Mutex::new(TimerEvent::new()));
         event_manager.add_subscriber(timeout_timer.clone());
         // This will allow the timeout timer to send the signal that makes KVM exit immediatly
-        Vcpu::register_kick_signal_handler();
-        // Make the event thread that epolls all the event fd & calls their callbacks.
-        // Note: we want to move as many things as possible away from this, as
-        // the async nature of it messes with, snapshot & reproducibility of
-        // executions
-        let t_vmm = Arc::clone(&vmm);
+        register_kick_signal_handler();
+        // Run the event manager in the same thread to avoid non-Send subscribers.
         let event_thread_handle = thread::Builder::new()
             .name("event_thread".to_string())
-            .spawn(move || {
-                loop {
-                    let _cnt = event_manager.run_with_timeout(500).unwrap();
-                    match t_vmm.lock().unwrap().shutdown_exit_code() {
-                        Some(FcExitCode::Ok) => break,
-                        Some(exit_code) => {
-                            return Err(anyhow::anyhow!(
-                                "Shutting down with exit code: {:?}",
-                                exit_code
-                            ))
-                        }
-                        None => continue,
-                    }
-                }
-                return Ok(());
-            })
+            .spawn(|| Ok(()))
             .unwrap();
         return Self {
             vcpu,
             vmm,
+            event_manager: RefCell::new(event_manager),
             vm_resources,
             event_thread_handle,
             block_devices,
@@ -183,14 +234,18 @@ impl NyxVM {
             breakpoint_manager: Box::new(BreakpointManager::new()),
             hw_breakpoints: HwBreakpoints::new(),
             active_snapshot: None,
+            serial_pty,
+            regs_cache: RefCell::new(None),
+            sregs_cache: RefCell::new(None),
+            last_nyx_breakpoint: RefCell::new(None),
         };
     }
 
     pub fn take_memory_snapshot(vmm: &Vmm, snap_type: SnapshotType) -> MemorySnapshot {
         let memory = match snap_type {
         SnapshotType::Base => {
-            assert_eq!(vmm.guest_memory().num_regions(), 1);
-            let region = vmm.guest_memory().find_region(GuestAddress(0)).unwrap();
+            assert_eq!(vmm.vm.guest_memory().num_regions(), 1);
+            let region = vmm.vm.guest_memory().find_region(GuestAddress(0)).unwrap();
             let region_len: usize = region.len().try_into().unwrap();
             let mut memory = vec![0; region_len];
             region
@@ -201,7 +256,7 @@ impl NyxVM {
         SnapshotType::Incremental => {
             let mut map = HashMap::new();
             Self::iter_dirty_pages(vmm, |region, page_addr|{
-                let mut data = vec![0; PAGE_SIZE as usize];
+                let mut data = vec![0; GUEST_PAGE_SIZE as usize];
 
                 region.read_slice(&mut data, MemoryRegionAddress(page_addr as u64)).unwrap();
                 map.insert(page_addr as u64, data);
@@ -209,8 +264,8 @@ impl NyxVM {
             MemorySnapshot::Incremental(map)
         }};
 
-        vmm.guest_memory().reset_dirty();
-        vmm.reset_dirty_bitmap();
+        vmm.vm.guest_memory().reset_dirty();
+        vmm.vm.reset_dirty_bitmap();
         return memory;
     }
 
@@ -244,11 +299,14 @@ impl NyxVM {
         let msrs = self
             .vcpu
             .kvm_vcpu
-            .get_msrs(&vec![
-                MSR_IA32_TSC,
-                MSR_IA32_TSCDEADLINE,
-                MSR_IA32_TSC_ADJUST,
-            ])
+            .get_msrs(
+                [
+                    MSR_IA32_TSC,
+                    MSR_IA32_TSC_DEADLINE,
+                    MSR_IA32_TSC_ADJUST,
+                ]
+                .into_iter(),
+            )
             .unwrap();
         let tsc = msrs[&MSR_IA32_TSC];
         let parent = self.active_snapshot.take();
@@ -267,39 +325,36 @@ impl NyxVM {
 
     fn save_vm_state(&self, vmm: &Vmm) -> MicrovmState {
         let vm_state = vmm.vm.save_state().unwrap();
-        let device_states = vmm.mmio_device_manager.save();
-        let memory_state = vmm.guest_memory().describe();
-        let acpi_dev_state = vmm.acpi_device_manager.save();
+        let device_states = vmm.device_manager.save();
         let vcpu_state = self.vcpu.kvm_vcpu.save_state().unwrap();
         let vm_info = vmm::persist::VmInfo::from(&self.vm_resources);
+        let kvm_state = vmm.kvm().save_state();
         // this is missing pio device state - notably shutdown and serial devices
         return MicrovmState {
             vm_info: vm_info,
-            memory_state,
+            kvm_state,
             vm_state,
             vcpu_states: vec![vcpu_state],
             device_states,
-            acpi_dev_state,
         };
     }
 
-    fn apply_snapshot_mmio(mmio: &MMIODeviceManager, snap: &NyxSnapshot) {
-        let ds = &snap.state.device_states;
+    fn apply_snapshot_mmio(
+        mmio: &MMIODeviceManager,
+        mem: &vmm::vstate::memory::GuestMemoryMmap,
+        snap: &NyxSnapshot,
+    ) {
+        let ds = &snap.state.device_states.mmio_state;
         let blocks = &ds.block_devices;
         for block_snap in blocks.iter() {
             if let BlockState::Virtio(vio_block_snap_state) = &block_snap.device_state {
                 let vstate = &vio_block_snap_state.virtio_state;
                 let device_id = &block_snap.device_id;
                 let bus_dev = mmio
-                    .get_device(DeviceType::Virtio(TYPE_BLOCK), device_id)
+                    .get_virtio_device(VIRTIO_ID_BLOCK, device_id)
                     .unwrap();
-                let mut locked_bus_dev = bus_dev.lock().unwrap();
-                let mmio_transport = locked_bus_dev.mmio_transport_mut().unwrap();
-                let t_snap = &block_snap.transport_state;
-                mmio_transport.features_select = t_snap.features_select;
-                mmio_transport.queue_select = t_snap.queue_select;
-                mmio_transport.device_status = t_snap.device_status;
-                mmio_transport.config_generation = t_snap.config_generation;
+                let mut mmio_transport = bus_dev.inner().lock().unwrap();
+                block_snap.transport_state.apply_to(&mut mmio_transport);
                 let mut locked_dev = mmio_transport.locked_device();
                 let cow_file_engine = locked_dev.as_cow_file_engine().expect("Trying to apply a snapshot to a non-cow block device");
                 cow_file_engine.reset_to(vio_block_snap_state.cow_state.id);
@@ -308,10 +363,21 @@ impl NyxVM {
                     .interrupt_status()
                     .store(vstate.interrupt_status, Ordering::Relaxed);
 
-                for (queue, queue_snap) in
-                    locked_dev.queues_mut().iter_mut().zip(vstate.queues.iter())
+                let queue_args = QueueConstructorArgs {
+                    mem: mem.clone(),
+                    is_activated: locked_dev.is_activated(),
+                };
+                let uses_notif_suppression =
+                    (vstate.acked_features & (1u64 << VIRTIO_RING_F_EVENT_IDX)) != 0;
+                for (queue, queue_snap) in locked_dev
+                    .queues_mut()
+                    .iter_mut()
+                    .zip(vstate.queues.iter())
                 {
-                    let new_queue = Queue::restore((), queue_snap).unwrap();
+                    let mut new_queue = Queue::restore(queue_args.clone(), queue_snap).unwrap();
+                    if uses_notif_suppression {
+                        new_queue.enable_notif_suppression();
+                    }
                     let _ = std::mem::replace(queue, new_queue);
                 }
             } else {
@@ -321,8 +387,8 @@ impl NyxVM {
     }
 
     fn apply_tsc(&mut self, tsc: u64) {
-        //let msrs = self.vcpu.kvm_vcpu.get_msrs(&vec![MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST]).unwrap();
-        //println!("MSRS: TSC {:x} (snapshot: {:x}) TSCDEADLINE {:x} TSC_ADJUST {:x}", msrs[&MSR_IA32_TSC], snap.tsc, msrs[&MSR_IA32_TSCDEADLINE], msrs[&MSR_IA32_TSC_ADJUST]);
+        //let msrs = self.vcpu.kvm_vcpu.get_msrs([MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE, MSR_IA32_TSC_ADJUST].into_iter()).unwrap();
+        //println!("MSRS: TSC {:x} (snapshot: {:x}) TSCDEADLINE {:x} TSC_ADJUST {:x}", msrs[&MSR_IA32_TSC], snap.tsc, msrs[&MSR_IA32_TSC_DEADLINE], msrs[&MSR_IA32_TSC_ADJUST]);
         let msrs_to_set = [
             // KVM "helpfully" tries to prevent us from updating TSC in small increments and ignores small delta updates.
             // update to an insane value first
@@ -341,18 +407,21 @@ impl NyxVM {
         let msrs_wrapper = Msrs::from_entries(&msrs_to_set).unwrap();
         let num_set = self.vcpu.kvm_vcpu.fd.set_msrs(&msrs_wrapper).unwrap();
         assert_eq!(num_set, msrs_to_set.len());
-        //let msrs = self.vcpu.kvm_vcpu.get_msrs(&vec![MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST]).unwrap();
-        //println!("MSRS: TSC {:x} (snapshot: {:x}) TSCDEADLINE {:x} TSC_ADJUST {:x}", msrs[&MSR_IA32_TSC], snap.tsc, msrs[&MSR_IA32_TSCDEADLINE], msrs[&MSR_IA32_TSC_ADJUST]);
+        //let msrs = self.vcpu.kvm_vcpu.get_msrs([MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE, MSR_IA32_TSC_ADJUST].into_iter()).unwrap();
+        //println!("MSRS: TSC {:x} (snapshot: {:x}) TSCDEADLINE {:x} TSC_ADJUST {:x}", msrs[&MSR_IA32_TSC], snap.tsc, msrs[&MSR_IA32_TSC_DEADLINE], msrs[&MSR_IA32_TSC_ADJUST]);
     }
 
     /// callback will be called with the guest memory GuestRegionMmap oject and
     /// the physical address of the dirty page once for every dirty page
-    pub fn iter_dirty_pages<Callback>(vmm: &Vmm, mut callback: Callback) 
-    where Callback: FnMut(&GuestRegionMmap, usize) {
-        let kvm_dirty_bitmap = vmm.get_dirty_bitmap().unwrap();
+    pub fn iter_dirty_pages<Callback>(vmm: &Vmm, mut callback: Callback)
+    where
+        Callback: FnMut(&GuestRegionMmapExt, usize),
+    {
+        let kvm_dirty_bitmap = vmm.vm.get_dirty_bitmap().unwrap();
         let page_size: usize = mem::PAGE_SIZE as usize;
 
-        for (slot, region) in vmm.guest_memory().iter().enumerate() {
+        for (slot, region) in vmm.vm.guest_memory().iter().enumerate() {
+            let slot = u32::try_from(slot).unwrap();
             let kvm_bitmap = kvm_dirty_bitmap.get(&slot).unwrap(); // kvm tracks pages dirtied during execution in this bitmap
             let firecracker_bitmap = region.bitmap(); // firecracker device emulation etc tracks dirty pages in this bitmap
 
@@ -435,7 +504,7 @@ impl NyxVM {
         } 
 
         self.active_snapshot = Some(snapshot.clone());
-        vmm.guest_memory().reset_dirty();
+        vmm.vm.guest_memory().reset_dirty();
 
         // The only ACPIDevice is the vmgenid device which we disable - no need to restore
         //println!("acpi state: {:#?}", &state.acpi_dev_state);
@@ -447,11 +516,14 @@ impl NyxVM {
             .unwrap();
 
         // we currently can't restore the net mmio device, only the block one
-        Self::apply_snapshot_mmio(&mut vmm.mmio_device_manager, snapshot);
+        let guest_mem = vmm.vm.guest_memory().clone();
+        Self::apply_snapshot_mmio(&vmm.device_manager.mmio_devices, &guest_mem, snapshot);
         // cpu might need to restore piodevices, investigate
         //Self::apply_snapshot_pio(&mut vmm.pio_device_manager, snap);
 
-        vmm.vm.restore_state(&snapshot.state.vm_state).unwrap();
+        let vm = Arc::get_mut(&mut vmm.vm).expect("exclusive VM access required to restore state");
+        vm.restore_state(&snapshot.state.vm_state).unwrap();
+        vmm.clear_shutdown_exit_code();
 
         // this should be done last, because KVM keeps tsc running - even when
         // the VM isn't. Doing this early will introduce additional
@@ -459,17 +531,31 @@ impl NyxVM {
         drop(vmm);
         self.apply_tsc(snapshot.tsc);
         self.continuation_state = snapshot.continuation_state.clone();
+        self.regs_cache.replace(None);
+        self.sregs_cache.replace(None);
     }
 
     pub fn sregs(&self) -> kvm_sregs {
-        return self.vcpu.kvm_vcpu.fd.get_sregs().unwrap();
+        if let Some(sregs) = self.sregs_cache.borrow().clone() {
+            return sregs;
+        }
+        let sregs = self.vcpu.kvm_vcpu.fd.get_sregs().unwrap();
+        self.sregs_cache.borrow_mut().replace(sregs);
+        sregs
     }
     pub fn regs(&self) -> kvm_regs {
-        return self.vcpu.kvm_vcpu.fd.get_regs().unwrap();
+        if let Some(regs) = self.regs_cache.borrow().clone() {
+            return regs;
+        }
+        let regs = self.vcpu.kvm_vcpu.fd.get_regs().unwrap();
+        self.regs_cache.borrow_mut().replace(regs);
+        regs
     }
 
     pub fn set_regs(&mut self, regs: &kvm_regs) {
         self.vcpu.kvm_vcpu.fd.set_regs(regs).unwrap();
+        self.regs_cache.borrow_mut().replace(regs.clone());
+        self.continuation_state = VMContinuationState::Main;
     }
 
     pub fn set_debug_state(&mut self, run_mode: RunMode, vmexit_on_swbp: bool ){
@@ -478,20 +564,28 @@ impl NyxVM {
             control |= KVM_GUESTDBG_SINGLESTEP;
             control |= KVM_GUESTDBG_BLOCKIRQ;
         };
-        if let RunMode::BranchStep = run_mode{
-            // It seems KVM completely ignores BTF bit - need to figure out why.
-            const BTF :usize = 1; // BTF is bit 1 in IA32_DEBUGCTLMSR
-            let msrs_to_set = [
-                kvm_msr_entry {
-                    index: MSR_IA32_DEBUGCTLMSR,
-                    data: 1<<BTF,
-                    ..Default::default()
-                },
-            ];
-            let msrs_wrapper = Msrs::from_entries(&msrs_to_set).unwrap();
-            let num_set = self.vcpu.kvm_vcpu.fd.set_msrs(&msrs_wrapper).unwrap();
-            assert_eq!(num_set,1);
+        // Set or clear BTF (branch trace flag) when requested.
+        const BTF: usize = 1;
+        let mut debugctl = self
+            .vcpu
+            .kvm_vcpu
+            .get_msrs([MSR_IA32_DEBUGCTLMSR].into_iter())
+            .ok()
+            .and_then(|msrs| msrs.get(&MSR_IA32_DEBUGCTLMSR).copied())
+            .unwrap_or(0);
+        if let RunMode::BranchStep = run_mode {
+            debugctl |= 1 << BTF;
+        } else {
+            debugctl &= !(1 << BTF);
         }
+        let msrs_to_set = [kvm_msr_entry {
+            index: MSR_IA32_DEBUGCTLMSR,
+            data: debugctl,
+            ..Default::default()
+        }];
+        let msrs_wrapper = Msrs::from_entries(&msrs_to_set).unwrap();
+        let num_set = self.vcpu.kvm_vcpu.fd.set_msrs(&msrs_wrapper).unwrap();
+        assert_eq!(num_set, 1);
         control |= if vmexit_on_swbp {KVM_GUESTDBG_USE_SW_BP} else {KVM_GUESTDBG_INJECT_BP};
         let mut arch  = kvm_guest_debug_arch::default();
         if self.hw_breakpoints.any_active() {
@@ -552,6 +646,9 @@ impl NyxVM {
         let start_time = time::Instant::now();
         self.timeout_timer.lock().unwrap().set_timeout(timeout);
         loop {
+            self.regs_cache.replace(None);
+            self.sregs_cache.replace(None);
+            let _ = self.event_manager.borrow_mut().run_with_timeout(0);
             let mut exit = None;
             match self.vcpu.run_emulation() {
                 // Emulation ran successfully, continue.
@@ -571,12 +668,18 @@ impl NyxVM {
                 Ok(VcpuEmulation::DebugEvent(dbg)) => {
                     let regs = self.regs();
                     let exc_reason = match dbg.exception {
-                        DBG_EXCEPTION_BREAKPOINT if regs.rax == NYX_LITE => UnparsedExitReason::Hypercall,
+                        DBG_EXCEPTION_BREAKPOINT if regs.rax == NYX_LITE => {
+                            self.last_nyx_breakpoint.replace(None);
+                            UnparsedExitReason::Hypercall
+                        }
                         DBG_EXCEPTION_BREAKPOINT if regs.rax != NYX_LITE => {
                             let sregs = self.sregs();
                             if self.breakpoint_manager.forward_guest_bp(sregs.cr3, regs.rip){
+                                self.last_nyx_breakpoint.replace(None);
                                 UnparsedExitReason::GuestBreakpoint
                             } else {
+                                self.last_nyx_breakpoint
+                                    .replace(Some((sregs.cr3, regs.rip)));
                                 UnparsedExitReason::NyxBreakpoint
                             }
                         }
@@ -648,6 +751,15 @@ impl NyxVM {
         self.breakpoint_manager.remove_all_breakpoints();
     }
 
+    pub(crate) fn disable_last_nyx_breakpoint(&mut self) {
+        let mut vmm = self.vmm.lock().unwrap();
+        if let Some((cr3, rip)) = *self.last_nyx_breakpoint.borrow() {
+            self.breakpoint_manager.disable_breakpoint(&mut vmm, cr3, rip);
+        } else {
+            self.breakpoint_manager.disable_all_breakpoints(&mut vmm);
+        }
+    }
+
     pub fn read_cstr_current(&self, guest_vaddr: u64) -> Vec<u8> {
         let cr3 = self.sregs().cr3;
         let vmm = self.vmm.lock().unwrap();
@@ -681,11 +793,27 @@ impl NyxVM {
         return res;
     }
 
-    pub fn branch_step(&mut self, _timeout: Duration) -> ExitReason{
-        panic!("access to MSRs is currently not working as expected")
-        // https://github.com/torvalds/linux/blob/master/arch/x86/kvm/vmx/pmu_intel.c
-        // TODO figure out how fix this
-        // return self.continue_vm(RunMode::BranchStep, timeout);
+    pub fn branch_step(&mut self, timeout: Duration) -> ExitReason{
+        let start = time::Instant::now();
+        let mut prev_rip = self.regs().rip;
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return ExitReason::Timeout;
+            }
+            let remaining = timeout.saturating_sub(elapsed);
+            let exit = self.continue_vm(RunMode::BranchStep, remaining);
+            match exit {
+                ExitReason::SingleStep => {
+                    let bytes = self.read_current_bytes(prev_rip, 16);
+                    if is_control_flow(prev_rip, &bytes) {
+                        return ExitReason::SingleStep;
+                    }
+                    prev_rip = self.regs().rip;
+                }
+                other => return other,
+            }
+        }
     }
 
     pub fn set_lbr(&mut self) {

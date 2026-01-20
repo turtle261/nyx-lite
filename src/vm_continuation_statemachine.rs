@@ -52,7 +52,6 @@ impl VMContinuationState{
             };
             vm.continuation_state = new_state;
             if let Some(user_event) = res {
-                vm.breakpoint_manager.disable_all_breakpoints(&mut vm.vmm.lock().unwrap());
                 return user_event;
             }
         }
@@ -84,7 +83,7 @@ impl VMContinuationState{
     fn force_ss(vm: &mut NyxVM, user_requested_singlestep: bool) -> (Self,Option<VMExitUserEvent>){
         let vmexit_on_swbp = true;
         vm.set_debug_state(RunMode::SingleStep, vmexit_on_swbp);
-        vm.breakpoint_manager.disable_all_breakpoints(&mut vm.vmm.lock().unwrap()); // step over the breakpoint(s)
+        vm.disable_last_nyx_breakpoint(); // step over the nyx breakpoint(s)
         let no_timeout = Duration::MAX;
         let exit = vm.run_inner(no_timeout);
         match exit {

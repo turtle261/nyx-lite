@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use event_manager::{EventOps, EventSet, Events, MutEventSubscriber};
 use timerfd::{SetTimeFlags, TimerFd, TimerState};
-use utils::signal::{sigrtmin, Killable};
+use vmm::utils::signal::{sigrtmin, Killable};
 use vmm::vstate::vcpu::VCPU_RTSIG_OFFSET;
 
 use libc::pthread_t;

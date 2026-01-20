@@ -6,10 +6,10 @@ use anyhow::Result;
 use event_manager::SubscriberOps;
 use vmm::builder::StartMicrovmError;
 use vmm::cpu_config::templates::GetCpuTemplate;
+use vmm::initrd::InitrdConfig;
 use vmm::resources::VmResources;
 use vmm::vmm_config::instance_info::InstanceInfo;
-use vmm::vstate::memory::GuestMemoryExtension;
-use vmm::vstate::memory::GuestMemoryMmap;
+use vmm::vstate::memory;
 use vmm::Vcpu;
 use vmm::Vmm;
 use vmm::{EventManager, VcpuHandle};
@@ -87,10 +87,12 @@ pub fn build_microvm_for_boot(
     use self::StartMicrovmError::*;
 
     let boot_config = vm_resources
-        .boot_source_builder()
+        .boot_source
+        .builder
+        .as_ref()
         .ok_or(MissingKernelConfig)?;
 
-    let track_dirty_pages = vm_resources.track_dirty_pages();
+    let track_dirty_pages = vm_resources.machine_config.track_dirty_pages;
 
     let vhost_user_device_used = vm_resources
         .block
@@ -107,40 +109,42 @@ pub fn build_microvm_for_boot(
     // because that would require running a backend process. If in the future we converge to
     // a single way of backing guest memory for vhost-user and non-vhost-user cases,
     // that would not be worth the effort.
-    let guest_memory = if vhost_user_device_used {
-        GuestMemoryMmap::memfd_backed(
-            vm_resources.vm_config.mem_size_mib,
-            track_dirty_pages,
-            vm_resources.vm_config.huge_pages,
-        )
-        .map_err(StartMicrovmError::GuestMemory)?
+    let regions = vmm::arch::arch_memory_regions(vm_resources.machine_config.mem_size_mib << 20);
+    let guest_regions = if vhost_user_device_used {
+        memory::memfd_backed(&regions, track_dirty_pages, vm_resources.machine_config.huge_pages)
+            .map_err(StartMicrovmError::GuestMemory)?
     } else {
-        let regions = vmm::arch::arch_memory_regions(vm_resources.vm_config.mem_size_mib << 20);
-        GuestMemoryMmap::from_raw_regions(
-            &regions,
+        memory::anonymous(
+            regions.iter().copied(),
             track_dirty_pages,
-            vm_resources.vm_config.huge_pages,
+            vm_resources.machine_config.huge_pages,
         )
         .map_err(StartMicrovmError::GuestMemory)?
     };
-
-    let entry_addr = vmm::builder::load_kernel(boot_config, &guest_memory)?;
-    let initrd = vmm::builder::load_initrd_from_config(boot_config, &guest_memory)?;
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
     let mut boot_cmdline = boot_config.cmdline.clone();
 
-    let cpu_template = vm_resources.vm_config.cpu_template.get_cpu_template()?;
+    let cpu_template = vm_resources.machine_config.cpu_template.get_cpu_template()?;
 
     let (mut vmm, mut vcpus) = vmm::builder::create_vmm_and_vcpus(
         instance_info,
         event_manager,
-        guest_memory,
+        guest_regions,
         None,
         track_dirty_pages,
-        vm_resources.vm_config.vcpu_count,
+        vm_resources.machine_config.vcpu_count,
         cpu_template.kvm_capabilities.clone(),
     )?;
+
+    let entry_addr = vmm::arch::load_kernel(&boot_config.kernel_file, vmm.vm.guest_memory())?;
+    let initrd = InitrdConfig::from_config(boot_config, vmm.vm.guest_memory())?;
+
+    if vm_resources.pci_enabled {
+        vmm.device_manager.enable_pci(&vmm.vm)?;
+    } else {
+        boot_cmdline.insert("pci", "off")?;
+    }
 
     // BEGIN NYX-LITE PATCH
     assert_eq!(vcpus.len(), 1);
@@ -162,13 +166,15 @@ pub fn build_microvm_for_boot(
     //     vmm::builder::attach_boot_timer_device(&mut vmm, request_ts)?;
     // }
     vmm::builder::attach_block_devices(
-        &mut vmm,
+        &mut vmm.device_manager,
+        &vmm.vm,
         &mut boot_cmdline,
         vm_resources.block.devices.iter(),
         event_manager,
     )?;
     vmm::builder::attach_net_devices(
-        &mut vmm,
+        &mut vmm.device_manager,
+        &vmm.vm,
         &mut boot_cmdline,
         vm_resources.net_builder.iter(),
         event_manager,
@@ -178,32 +184,43 @@ pub fn build_microvm_for_boot(
     //#[cfg(target_arch = "x86_64")]
     //vmm::builder::attach_vmgenid_device(&mut vmm)?;
 
-    vmm::builder::configure_system_for_boot(
-        &mut vmm,
-        vcpus.as_mut(),
-        &vm_resources.vm_config,
-        &cpu_template,
-        entry_addr,
-        &initrd,
-        boot_cmdline,
-    )?;
+    let vm_arc = vmm.vm.clone();
+    let kvm_ptr = vmm.kvm() as *const _;
+    // SAFETY: kvm_ptr points to vmm.kvm which outlives this call, and vm_arc
+    // keeps the VM alive while we mutably borrow the device manager.
+    unsafe {
+        vmm::arch::configure_system_for_boot(
+            &*kvm_ptr,
+            vm_arc.as_ref(),
+            &mut vmm.device_manager,
+            vcpus.as_mut(),
+            &vm_resources.machine_config,
+            &cpu_template,
+            entry_addr,
+            &initrd,
+            boot_cmdline,
+        )?;
+    }
 
     let mut vcpu = vcpus.into_iter().next().unwrap();
     let event_sender = vcpu.event_sender.take().expect("vCPU already started");
     let response_receiver = vcpu.response_receiver.take().unwrap();
+    let vcpu_fd = vcpu
+        .copy_kvm_vcpu_fd(vmm.vm.as_ref())
+        .map_err(StartMicrovmError::VcpuFdCloneError)?;
     let vcpu_join_handle = thread::Builder::new()
         .name(format!("fake vcpu thread"))
         .spawn(|| {})
         .unwrap();
-    let handle = VcpuHandle::new(event_sender, response_receiver, vcpu_join_handle);
+    let handle = VcpuHandle::new(event_sender, response_receiver, vcpu_fd, vcpu_join_handle);
 
     //END NYX-LITE PATCH
     vmm.vcpus_handles.push(handle);
     let vmm = Arc::new(Mutex::new(vmm));
     event_manager.add_subscriber(vmm.clone());
 
-    vcpu.set_mmio_bus(vmm.lock().unwrap().mmio_device_manager.bus.clone());
+    vcpu.set_mmio_bus(vmm.lock().unwrap().vm.common.mmio_bus.clone());
     vcpu.kvm_vcpu
-        .set_pio_bus(vmm.lock().unwrap().pio_device_manager.io_bus.clone());
+        .set_pio_bus(vmm.lock().unwrap().vm.pio_bus.clone());
     Ok((vmm, vcpu))
 }

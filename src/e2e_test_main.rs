@@ -17,13 +17,13 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use libc::{pthread_t, SIGSTOP};
-use nyx_lite::disassembly::{self, disassemble_print};
+use nyx_lite::disassembly;
 use nyx_lite::mem::{NyxMemExtension, PagePermission};
 use nyx_lite::snapshot::NyxSnapshot;
 use nyx_lite::vm_continuation_statemachine::VMContinuationState;
 use nyx_lite::{ExitReason, NyxVM};
 use utils::arg_parser::{ArgParser, Argument};
-use utils::signal::Killable;
+use vmm::utils::signal::Killable;
 use utils::validators::validate_instance_id;
 use vmm::logger::{error, info, LoggerConfig, LOGGER};
 

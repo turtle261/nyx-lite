@@ -78,7 +78,7 @@ pub trait GetMem{
 
 impl GetMem for Vmm{
     fn get_mem(&self) -> &GuestMemoryMmap {
-        self.guest_memory()
+        self.vm.guest_memory()
     }
 }
 
@@ -249,7 +249,12 @@ pub fn walk_virtual_pages<'mem>(
 // walks the page tables between start and end. Note: End is inclusive, not
 // exclusive. I.e. the last page will be starting at end. Will return all node
 // in the page tables (including not-presen & invalid phys address nodes)
-pub fn walk_page_tables(mem: &GuestMemoryMmap, cr3: u64, start: u64, last_page: u64) -> PTEWalker {
+pub fn walk_page_tables(
+    mem: &GuestMemoryMmap,
+    cr3: u64,
+    start: u64,
+    last_page: u64,
+) -> PTEWalker<'_> {
     PTEWalker::new(mem, cr3, start, last_page)
 }
 
@@ -599,10 +604,8 @@ mod tests {
 
     use std::collections::HashSet;
 
-    use vmm::{
-        vmm_config::machine_config::HugePageConfig,
-        vstate::memory::{GuestMemory, GuestMemoryExtension, GuestMemoryRegion},
-    };
+    use vmm::vmm_config::machine_config::HugePageConfig;
+    use vmm::vstate::memory::{self, GuestMemory, GuestMemoryRegion};
 
     use super::*;
 
@@ -911,9 +914,9 @@ mod tests {
             (region_1_address, page_size * 8),
             (region_2_address, page_size * 8),
         ];
-        let mem =
-            GuestMemoryMmap::from_raw_regions(&mem_regions, true, HugePageConfig::None).unwrap();
-        return mem;
+        let regions = memory::anonymous(mem_regions.into_iter(), false, HugePageConfig::None)
+            .expect("failed to allocate test memory");
+        memory::test_utils::into_region_ext(regions)
     }
 
     fn store(mem: &GuestMemoryMmap, addr: GuestAddress, val: u64) {

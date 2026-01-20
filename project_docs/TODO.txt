@@ -23,13 +23,13 @@ Loading VMs
     docker first
 
 bugfixes:
-* test and ensure SIMD instructions calculate correct memory accesses for ExitReason::BadMemoryAccess
-* fix BTF Branch Based single step via MSR_IA32_DEBUGCTLMSR
+* DONE: test and ensure SIMD instructions calculate correct memory accesses for ExitReason::BadMemoryAccess
+* DONE: fix BTF Branch Based single step via MSR_IA32_DEBUGCTLMSR
 * fix kvm dirty ring api to speed up snapshots
 * fix host atomic bitmap to speed up snapshots
 * fix nested virtualization
-* fix console output by redirect serial into a ptty
-* ensure snapshot reset fixes VM shutdown
-* make it so that changing IP resets vm.continuation state as appropriate
-* make regs() and sregs() not read the register for every call
-* speed up breakpoints by not enabling/disabling them ALL the time.
+* DONE: fix console output by redirect serial into a ptty (serial_out_path now defaults to a PTY when unset)
+* DONE: ensure snapshot reset fixes VM shutdown
+* DONE: changing IP resets vm.continuation state as appropriate (set_regs now resets continuation)
+* DONE: regs() and sregs() are cached during run loop
+* DONE: speed up breakpoints by not enabling/disabling them ALL the time.

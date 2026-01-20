@@ -1,4 +1,8 @@
 Caught these error messages:
+
+Update (2026-01):
+- Queue panic "available virtio descriptors > queue size" addressed by resyncing next_avail on wrap.
+- MMIO queue notify is handled in mmio transport to avoid relying on ioeventfds for COW block paths.
 1)
 [    2.301987] virtio_blk virtio0: req.0:id 141 is not a head!
 [    2.302689] I/O error, dev vda, sector 267616 op 0x0:(READ) flags 0x80700 phys_seg 1 prio class 2
