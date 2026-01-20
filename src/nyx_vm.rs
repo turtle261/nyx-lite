@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use std::ptr::NonNull;
 use std::fs::File;
 use std::path::PathBuf;
 use std::os::unix::io::FromRawFd;
@@ -16,7 +17,8 @@ use event_manager::SubscriberOps;
 use iced_x86::OpAccess;
 use vmm::arch::GUEST_PAGE_SIZE;
 use vmm::arch::x86_64::generated::msr_index::{
-    MSR_IA32_DEBUGCTLMSR, MSR_IA32_TSC, MSR_IA32_TSC_ADJUST, MSR_IA32_TSC_DEADLINE,
+    MSR_IA32_DEBUGCTLMSR, MSR_IA32_DS_AREA, MSR_IA32_TSC, MSR_IA32_TSC_ADJUST,
+    MSR_IA32_TSC_DEADLINE,
 };
 use vmm::device_manager::mmio::MMIODeviceManager;
 use vmm::devices::virtio::block::device::Block;
@@ -27,6 +29,7 @@ use vmm::devices::virtio::generated::virtio_ids::VIRTIO_ID_BLOCK;
 use vmm::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vmm::logger::debug;
 use vmm::persist::MicrovmState;
+use vmm::cpu_config::templates::StaticCpuTemplate;
 use vmm::resources::VmResources;
 use vmm::snapshot::Persist;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
@@ -38,21 +41,28 @@ use vmm::vstate::vcpu::{VcpuEmulation, VcpuError, VCPU_RTSIG_OFFSET};
 use vmm::Vcpu;
 use vmm::Vmm;
 use vmm::{EventManager, VcpuEvent};
+use vmm::utils::get_page_size;
+use vm_memory::Address;
 
-use kvm_bindings::{kvm_guest_debug_arch, kvm_msr_entry, kvm_regs, kvm_sregs, Msrs, KVM_GUESTDBG_BLOCKIRQ, KVM_GUESTDBG_INJECT_BP, KVM_GUESTDBG_USE_HW_BP};
-use kvm_bindings::kvm_guest_debug;
-use kvm_bindings::KVM_GUESTDBG_ENABLE;
-use kvm_bindings::KVM_GUESTDBG_USE_SW_BP;
-use kvm_bindings::KVM_GUESTDBG_SINGLESTEP;
+use kvm_bindings::{
+    kvm_dirty_gfn, kvm_enable_cap, kvm_guest_debug, kvm_guest_debug_arch, kvm_msr_entry, kvm_regs,
+    kvm_sregs, Msrs, KVM_CAP_DIRTY_LOG_RING, KVM_DIRTY_LOG_PAGE_OFFSET,
+    KVM_GUESTDBG_BLOCKIRQ, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_INJECT_BP, KVM_GUESTDBG_SINGLESTEP,
+    KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP,
+};
 
+use crate::error::MemoryError;
 use crate::breakpoints::{BreakpointManager, BreakpointManagerTrait};
 use crate::disassembly::{disassemble_memory_accesses, is_control_flow};
 use crate::firecracker_wrappers::build_microvm_for_boot;
 use crate::hw_breakpoints::HwBreakpoints;
-use crate::snapshot::{MemorySnapshot, NyxSnapshot, SnapshotType};
+use crate::snapshot::{BaseRegionSnapshot, MemorySnapshot, NyxSnapshot, SnapshotType};
 use crate::timer_event::TimerEvent;
 use crate::vm_continuation_statemachine::{RunMode, VMContinuationState, VMExitUserEvent};
-use crate::mem::{self, GetMem, NyxMemExtension};
+use crate::mem::{
+    self, GetMem, HostDirtyTracker, LockedVmm, NyxMemExtension, PageAllocator, PageMapping,
+    ProcessMemory, SharedMemoryRegion,
+};
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
 pub enum DebugState{
@@ -72,6 +82,60 @@ const DR6_HWBP_0: u64 = 1 << 0;
 const DR6_HWBP_1: u64 = 1 << 1;
 const DR6_HWBP_2: u64 = 1 << 2;
 const DR6_HWBP_3: u64 = 1 << 3;
+const KVM_DIRTY_GFN_F_DIRTY: u32 = 1;
+const KVM_DIRTY_GFN_F_RESET: u32 = 2;
+const KVM_DIRTY_RING_MAX_ENTRIES: usize = 65536;
+const CANONICAL_USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+const DEBUGCTL_BTF: u64 = 1 << 1;
+const DEBUGCTL_BTS: u64 = 1 << 7;
+const DEBUGCTL_BTINT: u64 = 1 << 8;
+const DEBUGCTL_BTS_OFF_OS: u64 = 1 << 9;
+const DEBUGCTL_BTS_OFF_USR: u64 = 1 << 10;
+
+fn is_canonical_user_addr(addr: u64) -> bool {
+    addr < CANONICAL_USER_LIMIT
+}
+
+#[derive(Debug, Copy, Clone)]
+struct DirtyRingEntry {
+    slot: u32,
+    offset: u64,
+}
+
+#[derive(Debug)]
+struct DirtyRingState {
+    entries: NonNull<kvm_dirty_gfn>,
+    entry_count: usize,
+    head: u32,
+    page_size: u64,
+    slot_bases: HashMap<u32, GuestAddress>,
+    slot_sizes: HashMap<u32, usize>,
+}
+
+impl DirtyRingState {
+    fn drain(&mut self) -> Vec<DirtyRingEntry> {
+        let mut entries = Vec::new();
+        let count = self.entry_count as u32;
+        for _ in 0..self.entry_count {
+            let idx = (self.head % count) as usize;
+            let entry_ptr = unsafe { self.entries.as_ptr().add(idx) };
+            let entry = unsafe { std::ptr::read_volatile(entry_ptr) };
+            if (entry.flags & KVM_DIRTY_GFN_F_DIRTY) == 0 {
+                break;
+            }
+            entries.push(DirtyRingEntry {
+                slot: entry.slot,
+                offset: entry.offset,
+            });
+            let new_flags = entry.flags | KVM_DIRTY_GFN_F_RESET;
+            unsafe {
+                std::ptr::write_volatile(&mut (*entry_ptr).flags, new_flags);
+            }
+            self.head = self.head.wrapping_add(1);
+        }
+        entries
+    }
+}
 pub struct NyxVM {
     pub vmm: Arc<Mutex<Vmm>>,
     pub vcpu: Vcpu,
@@ -88,6 +152,10 @@ pub struct NyxVM {
     regs_cache: RefCell<Option<kvm_regs>>,
     sregs_cache: RefCell<Option<kvm_sregs>>,
     last_nyx_breakpoint: RefCell<Option<(u64, u64)>>,
+    dirty_ring: Option<DirtyRingState>,
+    dirty_ring_backlog: Vec<DirtyRingEntry>,
+    host_dirty: Arc<HostDirtyTracker>,
+    shared_pages: HashSet<u64>,
 }
 
 #[derive(Debug)]
@@ -168,6 +236,22 @@ pub enum ExitReason {
     Interrupted,
 }
 
+/// Configuration for enabling Branch Trace Store (BTS) via DEBUGCTL.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct BtsConfig {
+    pub enable: bool,
+    pub interrupt: bool,
+    pub off_user: bool,
+    pub off_kernel: bool,
+}
+
+/// Control whether shared memory pages are snapshotted or preserved across resets.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SharedMemoryPolicy {
+    Snapshot,
+    Preserve,
+}
+
 impl NyxVM {
     // NOTE: due to the fact that timeout timers are tied to the thread that
     // makes the NyxVM (see TimerEvent for more details), it's probably unsafe
@@ -209,9 +293,14 @@ impl NyxVM {
 
         debug!("event_start: build microvm for boot");
 
-        let (vmm, vcpu) = build_microvm_for_boot(&instance_info, &vm_resources, &mut event_manager)
+        let (vmm, mut vcpu) = build_microvm_for_boot(&instance_info, &vm_resources, &mut event_manager)
             .expect("couldn't prepare vm");
         debug!("event_end: build microvm for boot");
+
+        let dirty_ring = {
+            let vmm_guard = vmm.lock().unwrap();
+            Self::try_enable_dirty_ring(&vmm_guard, &mut vcpu)
+        };
         
         let timeout_timer = Arc::new(Mutex::new(TimerEvent::new()));
         event_manager.add_subscriber(timeout_timer.clone());
@@ -222,6 +311,19 @@ impl NyxVM {
             .name("event_thread".to_string())
             .spawn(|| Ok(()))
             .unwrap();
+        let total_pages = {
+            let vmm_guard = vmm.lock().unwrap();
+            vmm_guard
+                .vm
+                .guest_memory()
+                .iter()
+                .map(|region| {
+                    let len = region.len() as usize;
+                    (len + mem::PAGE_SIZE as usize - 1) / mem::PAGE_SIZE as usize
+                })
+                .sum()
+        };
+
         return Self {
             vcpu,
             vmm,
@@ -238,34 +340,205 @@ impl NyxVM {
             regs_cache: RefCell::new(None),
             sregs_cache: RefCell::new(None),
             last_nyx_breakpoint: RefCell::new(None),
+            dirty_ring,
+            dirty_ring_backlog: Vec::new(),
+            host_dirty: Arc::new(HostDirtyTracker::new(total_pages)),
+            shared_pages: HashSet::new(),
         };
     }
 
-    pub fn take_memory_snapshot(vmm: &Vmm, snap_type: SnapshotType) -> MemorySnapshot {
+    fn try_enable_dirty_ring(vmm: &Vmm, vcpu: &mut Vcpu) -> Option<DirtyRingState> {
+        if vmm
+            .kvm()
+            .fd
+            .check_extension_raw(u64::from(KVM_CAP_DIRTY_LOG_RING))
+            == 0
+        {
+            return None;
+        }
+
+        let page_size = get_page_size().ok()? as usize;
+        let run_size = vmm.vm.fd().run_size();
+        let offset_bytes = (KVM_DIRTY_LOG_PAGE_OFFSET as usize).checked_mul(page_size)?;
+        if run_size <= offset_bytes {
+            debug!("dirty ring unsupported: vcpu mmap too small");
+            return None;
+        }
+
+        let max_entries =
+            (run_size - offset_bytes) / std::mem::size_of::<kvm_dirty_gfn>();
+        if max_entries == 0 {
+            debug!("dirty ring unsupported: no space for entries");
+            return None;
+        }
+        let entry_count = std::cmp::min(max_entries, KVM_DIRTY_RING_MAX_ENTRIES);
+
+        let mut cap = kvm_enable_cap::default();
+        cap.cap = KVM_CAP_DIRTY_LOG_RING;
+        cap.args[0] = entry_count as u64;
+        if let Err(err) = vmm.vm.fd().enable_cap(&cap) {
+            debug!("dirty ring enable failed: {}", err);
+            return None;
+        }
+
+        let run_ptr = vcpu.kvm_vcpu.fd.get_kvm_run() as *mut _ as *mut u8;
+        let ring_ptr = unsafe { run_ptr.add(offset_bytes) as *mut kvm_dirty_gfn };
+        let entries = NonNull::new(ring_ptr)?;
+
+        let mut slot_bases = HashMap::new();
+        let mut slot_sizes = HashMap::new();
+        for region in vmm.vm.guest_memory().iter() {
+            let slot_size = region.slot_size();
+            for slot in region.slot_range() {
+                if let Some(base) = region.slot_base(slot) {
+                    slot_bases.insert(slot, base);
+                    slot_sizes.insert(slot, slot_size);
+                }
+            }
+        }
+
+        Some(DirtyRingState {
+            entries,
+            entry_count,
+            head: 0,
+            page_size: page_size as u64,
+            slot_bases,
+            slot_sizes,
+        })
+    }
+
+    pub fn process_memory(&self, cr3: u64) -> ProcessMemory<LockedVmm> {
+        let backend = LockedVmm::new(self.vmm.clone());
+        ProcessMemory::new(backend, cr3).with_host_dirty(self.host_dirty.clone())
+    }
+
+    pub fn current_process_memory(&self) -> ProcessMemory<LockedVmm> {
+        let cr3 = self.sregs().cr3;
+        self.process_memory(cr3)
+    }
+
+    /// Registers a guest memory range as shared and optionally excludes it from snapshot resets.
+    pub fn register_shared_region(
+        &mut self,
+        cr3: u64,
+        vaddr: u64,
+        len: usize,
+        policy: SharedMemoryPolicy,
+    ) -> Result<SharedMemoryRegion<LockedVmm>, MemoryError> {
+        if len == 0 {
+            return Ok(SharedMemoryRegion::new(
+                self.process_memory(cr3),
+                vaddr,
+                0,
+            ));
+        }
+        if policy == SharedMemoryPolicy::Preserve {
+            let start = vaddr & mem::M_PAGE_ALIGN;
+            let end = vaddr
+                .checked_add(len as u64 - 1)
+                .unwrap_or(u64::MAX)
+                & mem::M_PAGE_ALIGN;
+            let mut cur = start;
+            let process = self.process_memory(cr3);
+            while cur <= end {
+                let phys = process.resolve_vaddr(cur)?;
+                self.shared_pages.insert(phys.raw_value());
+                if let Some(next) = cur.checked_add(mem::PAGE_SIZE) {
+                    cur = next;
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(SharedMemoryRegion::new(
+            self.process_memory(cr3),
+            vaddr,
+            len,
+        ))
+    }
+
+    pub fn register_shared_region_current(
+        &mut self,
+        vaddr: u64,
+        len: usize,
+        policy: SharedMemoryPolicy,
+    ) -> Result<SharedMemoryRegion<LockedVmm>, MemoryError> {
+        let cr3 = self.sregs().cr3;
+        self.register_shared_region(cr3, vaddr, len, policy)
+    }
+
+    pub fn inject_mapping(
+        &self,
+        cr3: u64,
+        vaddr: u64,
+        paddr: u64,
+        mapping: PageMapping,
+        allocator: Option<&mut dyn PageAllocator>,
+    ) -> Result<(), MemoryError> {
+        self.process_memory(cr3)
+            .map_page(vaddr, paddr, mapping, allocator)
+    }
+
+    pub fn inject_code(
+        &self,
+        cr3: u64,
+        vaddr: u64,
+        paddr: u64,
+        code: &[u8],
+        mapping: PageMapping,
+        allocator: Option<&mut dyn PageAllocator>,
+    ) -> Result<(), MemoryError> {
+        self.process_memory(cr3)
+            .inject_code(vaddr, paddr, code, mapping, allocator)
+    }
+
+    fn take_memory_snapshot_with_state(
+        vmm: &Vmm,
+        snap_type: SnapshotType,
+        dirty_ring: &mut Option<DirtyRingState>,
+        dirty_ring_backlog: &mut Vec<DirtyRingEntry>,
+        host_dirty: &HostDirtyTracker,
+        shared_pages: &HashSet<u64>,
+    ) -> MemorySnapshot {
         let memory = match snap_type {
         SnapshotType::Base => {
-            assert_eq!(vmm.vm.guest_memory().num_regions(), 1);
-            let region = vmm.vm.guest_memory().find_region(GuestAddress(0)).unwrap();
-            let region_len: usize = region.len().try_into().unwrap();
-            let mut memory = vec![0; region_len];
-            region
-                .read_slice(&mut memory, MemoryRegionAddress(0))
-                .unwrap();
-            MemorySnapshot::Base(memory)
+            let mut regions = Vec::new();
+            for region in vmm.vm.guest_memory().iter() {
+                let region_len: usize = region.len().try_into().unwrap_or(0);
+                let mut memory = vec![0; region_len];
+                region
+                    .read_slice(&mut memory, MemoryRegionAddress(0))
+                    .unwrap();
+                regions.push(BaseRegionSnapshot {
+                    start: region.start_addr().raw_value(),
+                    data: Arc::from(memory),
+                });
+            }
+            MemorySnapshot::Base(regions)
         },
         SnapshotType::Incremental => {
             let mut map = HashMap::new();
-            Self::iter_dirty_pages(vmm, |region, page_addr|{
-                let mut data = vec![0; GUEST_PAGE_SIZE as usize];
+            Self::iter_dirty_pages_with_state(
+                vmm,
+                dirty_ring,
+                dirty_ring_backlog,
+                host_dirty,
+                |region, region_offset, guest_addr| {
+                    if shared_pages.contains(&guest_addr) {
+                        return;
+                    }
+                    let mut data = vec![0; GUEST_PAGE_SIZE as usize];
 
-                region.read_slice(&mut data, MemoryRegionAddress(page_addr as u64)).unwrap();
-                map.insert(page_addr as u64, data);
-            });
+                    region
+                        .read_slice(&mut data, MemoryRegionAddress(region_offset as u64))
+                        .unwrap();
+                    map.insert(guest_addr, data);
+                },
+            );
             MemorySnapshot::Incremental(map)
         }};
 
-        vmm.vm.guest_memory().reset_dirty();
-        vmm.vm.reset_dirty_bitmap();
+        Self::reset_dirty_tracking_with_state(vmm, dirty_ring, dirty_ring_backlog, host_dirty);
         return memory;
     }
 
@@ -279,12 +552,20 @@ impl NyxVM {
     }
 
     pub fn take_snapshot_with_type(&mut self, snap_type: SnapshotType) -> Arc<NyxSnapshot>{
-        let vmm = self.vmm.lock().unwrap();
-
         if snap_type == SnapshotType::Incremental {
             assert!(self.active_snapshot.is_some(), "can't take an incremental snapshot without a basis snapshot!");
         }
-        let memory = Self::take_memory_snapshot(&vmm, snap_type);
+        let memory = {
+            let vmm = self.vmm.lock().unwrap();
+            Self::take_memory_snapshot_with_state(
+                &vmm,
+                snap_type,
+                &mut self.dirty_ring,
+                &mut self.dirty_ring_backlog,
+                &self.host_dirty,
+                &self.shared_pages,
+            )
+        };
 
         //let block_device_snapshots = self.block_devices.iter().map(|dev| {
         //    // This flushes all changes to the backing file
@@ -311,6 +592,7 @@ impl NyxVM {
         let tsc = msrs[&MSR_IA32_TSC];
         let parent = self.active_snapshot.take();
         let depth = parent.as_ref().map(|p| p.depth+1).unwrap_or(0);
+        let vmm = self.vmm.lock().unwrap();
         let new_snap =  Arc::new(NyxSnapshot {
             parent,
             depth, 
@@ -411,19 +693,126 @@ impl NyxVM {
         //println!("MSRS: TSC {:x} (snapshot: {:x}) TSCDEADLINE {:x} TSC_ADJUST {:x}", msrs[&MSR_IA32_TSC], snap.tsc, msrs[&MSR_IA32_TSC_DEADLINE], msrs[&MSR_IA32_TSC_ADJUST]);
     }
 
-    /// callback will be called with the guest memory GuestRegionMmap oject and
-    /// the physical address of the dirty page once for every dirty page
-    pub fn iter_dirty_pages<Callback>(vmm: &Vmm, mut callback: Callback)
+    fn reset_dirty_tracking_with_state(
+        vmm: &Vmm,
+        dirty_ring: &mut Option<DirtyRingState>,
+        dirty_ring_backlog: &mut Vec<DirtyRingEntry>,
+        host_dirty: &HostDirtyTracker,
+    ) {
+        vmm.vm.guest_memory().reset_dirty();
+        if dirty_ring.is_some() {
+            dirty_ring_backlog.clear();
+            if let Err(err) = vmm.vm.reset_dirty_rings() {
+                debug!("failed to reset dirty ring: {}", err);
+            }
+        } else {
+            vmm.vm.reset_dirty_bitmap();
+        }
+        host_dirty.clear();
+    }
+
+    fn drain_dirty_ring_backlog(
+        vmm: &Vmm,
+        dirty_ring: &mut Option<DirtyRingState>,
+        dirty_ring_backlog: &mut Vec<DirtyRingEntry>,
+    ) {
+        let Some(ring) = dirty_ring.as_mut() else {
+            return;
+        };
+        let entries = ring.drain();
+        if !entries.is_empty() {
+            dirty_ring_backlog.extend(entries);
+        }
+        if let Err(err) = vmm.vm.reset_dirty_rings() {
+            debug!("failed to reset dirty ring: {}", err);
+        }
+    }
+
+    fn dirty_ring_entry_to_region_offset<'a>(
+        ring: &DirtyRingState,
+        mem: &'a vmm::vstate::memory::GuestMemoryMmap,
+        entry: DirtyRingEntry,
+    ) -> Option<(&'a GuestRegionMmapExt, usize, u64)> {
+        let base = *ring.slot_bases.get(&entry.slot)?;
+        let slot_size = *ring.slot_sizes.get(&entry.slot)?;
+        let offset_bytes = entry.offset.checked_mul(ring.page_size)?;
+        if offset_bytes >= slot_size as u64 {
+            return None;
+        }
+        let guest_addr = base.raw_value().checked_add(offset_bytes)?;
+        let region = mem.find_region(GuestAddress(guest_addr))?;
+        let region_offset = guest_addr
+            .checked_sub(region.start_addr().raw_value())?
+            .try_into()
+            .ok()?;
+        Some((region, region_offset, guest_addr))
+    }
+
+    /// callback will be called with the guest memory GuestRegionMmap object,
+    /// the region offset of the dirty page, and the guest physical address.
+    fn iter_dirty_pages_with_state<Callback>(
+        vmm: &Vmm,
+        dirty_ring: &mut Option<DirtyRingState>,
+        dirty_ring_backlog: &mut Vec<DirtyRingEntry>,
+        host_dirty: &HostDirtyTracker,
+        mut callback: Callback,
+    )
     where
-        Callback: FnMut(&GuestRegionMmapExt, usize),
+        Callback: FnMut(&GuestRegionMmapExt, usize, u64),
     {
+        let mut seen = HashSet::new();
+        let host_pages = host_dirty.snapshot_pages();
+        for guest_addr in host_pages {
+            if let Some(region) = vmm.vm.guest_memory().find_region(GuestAddress(guest_addr)) {
+                let region_offset = guest_addr
+                    .checked_sub(region.start_addr().raw_value())
+                    .and_then(|val| usize::try_from(val).ok());
+                if let Some(region_offset) = region_offset {
+                    if seen.insert(guest_addr) {
+                        callback(region, region_offset, guest_addr);
+                    }
+                }
+            }
+        }
+
+        if dirty_ring.is_some() {
+            Self::drain_dirty_ring_backlog(vmm, dirty_ring, dirty_ring_backlog);
+            let ring = dirty_ring.as_mut().unwrap();
+            let mut pending = std::mem::take(dirty_ring_backlog);
+            for entry in pending.drain(..) {
+                if let Some((region, region_offset, guest_addr)) =
+                    Self::dirty_ring_entry_to_region_offset(ring, vmm.vm.guest_memory(), entry)
+                {
+                    if seen.insert(guest_addr) {
+                        callback(region, region_offset, guest_addr);
+                    }
+                }
+            }
+
+            let page_size = ring.page_size as usize;
+            for region in vmm.vm.guest_memory().iter() {
+                let firecracker_bitmap = region.bitmap();
+                let region_len: usize = region.len().try_into().unwrap_or(0);
+                for region_offset in (0..region_len).step_by(page_size) {
+                    if firecracker_bitmap.dirty_at(region_offset) {
+                        let guest_addr =
+                            region.start_addr().raw_value() + region_offset as u64;
+                        if seen.insert(guest_addr) {
+                            callback(region, region_offset, guest_addr);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         let kvm_dirty_bitmap = vmm.vm.get_dirty_bitmap().unwrap();
         let page_size: usize = mem::PAGE_SIZE as usize;
 
         for (slot, region) in vmm.vm.guest_memory().iter().enumerate() {
             let slot = u32::try_from(slot).unwrap();
-            let kvm_bitmap = kvm_dirty_bitmap.get(&slot).unwrap(); // kvm tracks pages dirtied during execution in this bitmap
-            let firecracker_bitmap = region.bitmap(); // firecracker device emulation etc tracks dirty pages in this bitmap
+            let kvm_bitmap = kvm_dirty_bitmap.get(&slot).unwrap();
+            let firecracker_bitmap = region.bitmap();
 
             for (i, v) in kvm_bitmap.iter().enumerate() {
                 for j in 0..64 {
@@ -433,7 +822,9 @@ impl NyxVM {
                     let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_addr);
 
                     if is_kvm_page_dirty || is_firecracker_page_dirty {
-                        callback(region, page_addr);
+                        let guest_addr =
+                            region.start_addr().raw_value() + page_addr as u64;
+                        callback(region, page_addr, guest_addr);
                     }
                 }
             }
@@ -481,30 +872,124 @@ impl NyxVM {
         }
     }
 
+    fn ensure_snapshot_compat(&self, snapshot: &NyxSnapshot) {
+        let info = &snapshot.state.vm_info;
+        let machine = &self.vm_resources.machine_config;
+        let cpu_template = StaticCpuTemplate::from(&machine.cpu_template);
+        assert_eq!(
+            info.mem_size_mib,
+            machine.mem_size_mib as u64,
+            "snapshot memory size mismatch"
+        );
+        assert_eq!(info.smt, machine.smt, "snapshot smt mismatch");
+        assert_eq!(
+            info.cpu_template,
+            cpu_template,
+            "snapshot cpu template mismatch"
+        );
+        assert_eq!(
+            info.huge_pages, machine.huge_pages,
+            "snapshot huge page config mismatch"
+        );
+        assert_eq!(
+            info.enable_nested_virt, machine.enable_nested_virt,
+            "snapshot nested virt mismatch"
+        );
+        assert_eq!(
+            snapshot.state.vcpu_states.len(),
+            machine.vcpu_count as usize,
+            "snapshot vcpu count mismatch"
+        );
+    }
+
+    /// Applies a snapshot. If there is no active snapshot, only a root snapshot is accepted.
     pub fn apply_snapshot(&mut self, snapshot: &Arc<NyxSnapshot>) {
         let mut vmm = self.vmm.lock().unwrap();
+        self.ensure_snapshot_compat(snapshot);
+
+        if self.active_snapshot.is_none() {
+            if snapshot.depth != 0 || snapshot.memory.is_incremental() {
+                panic!("can only apply root snapshots to VMs without an active snapshot");
+            }
+            let shared_pages = self.shared_pages.clone();
+            for region in vmm.vm.guest_memory().iter() {
+                let region_len: usize = region.len().try_into().unwrap_or(0);
+                for offset in (0..region_len).step_by(GUEST_PAGE_SIZE as usize) {
+                    let guest_addr = region.start_addr().raw_value() + offset as u64;
+                    if shared_pages.contains(&guest_addr) {
+                        continue;
+                    }
+                    snapshot.get_page(guest_addr as usize, |slice| {
+                        region
+                            .write_slice(slice, MemoryRegionAddress(offset as u64))
+                            .unwrap();
+                    });
+                }
+            }
+            Self::reset_dirty_tracking_with_state(
+                &vmm,
+                &mut self.dirty_ring,
+                &mut self.dirty_ring_backlog,
+                &self.host_dirty,
+            );
+            self.active_snapshot = Some(snapshot.clone());
+            self.vcpu
+                .kvm_vcpu
+                .restore_state(&snapshot.state.vcpu_states[0])
+                .unwrap();
+            let guest_mem = vmm.vm.guest_memory().clone();
+            Self::apply_snapshot_mmio(&vmm.device_manager.mmio_devices, &guest_mem, snapshot);
+            let vm = Arc::get_mut(&mut vmm.vm)
+                .expect("exclusive VM access required to restore state");
+            vm.restore_state(&snapshot.state.vm_state).unwrap();
+            vmm.clear_shutdown_exit_code();
+            drop(vmm);
+            self.apply_tsc(snapshot.tsc);
+            self.continuation_state = snapshot.continuation_state.clone();
+            self.regs_cache.replace(None);
+            self.sregs_cache.replace(None);
+            return;
+        }
 
         let mut pages_reset = HashSet::new();
-        let active_snapshot = self.active_snapshot.as_ref().expect("can only apply snapshots on VMs with an active snapshot");
+        let active_snapshot = self
+            .active_snapshot
+            .as_ref()
+            .expect("can only apply snapshots on VMs with an active snapshot");
 
         let fast_path = Arc::ptr_eq(snapshot, active_snapshot);
+        let shared_pages = self.shared_pages.clone();
 
-        Self::iter_dirty_pages(&mut vmm, |region, page_addr|{
-            let target_addr = MemoryRegionAddress(page_addr.try_into().unwrap());
-            snapshot.get_page(page_addr, |slice| { 
-                region.write_slice(slice, target_addr).unwrap();
-                if !fast_path{
-                    pages_reset.insert(page_addr as u64);
+        Self::iter_dirty_pages_with_state(
+            &vmm,
+            &mut self.dirty_ring,
+            &mut self.dirty_ring_backlog,
+            &self.host_dirty,
+            |region, region_offset, guest_addr| {
+                if shared_pages.contains(&guest_addr) {
+                    return;
                 }
-            } );
-        });
+                let target_addr = MemoryRegionAddress(region_offset.try_into().unwrap());
+                snapshot.get_page(guest_addr as usize, |slice| {
+                    region.write_slice(slice, target_addr).unwrap();
+                    if !fast_path {
+                        pages_reset.insert(guest_addr);
+                    }
+                });
+            },
+        );
 
         if !fast_path {
             Self::apply_deltas_to_least_common_ancestor(&mut vmm, &mut pages_reset, active_snapshot.clone(), snapshot.clone());
         } 
 
         self.active_snapshot = Some(snapshot.clone());
-        vmm.vm.guest_memory().reset_dirty();
+        Self::reset_dirty_tracking_with_state(
+            &vmm,
+            &mut self.dirty_ring,
+            &mut self.dirty_ring_backlog,
+            &self.host_dirty,
+        );
 
         // The only ACPIDevice is the vmgenid device which we disable - no need to restore
         //println!("acpi state: {:#?}", &state.acpi_dev_state);
@@ -558,6 +1043,70 @@ impl NyxVM {
         self.continuation_state = VMContinuationState::Main;
     }
 
+    fn read_debugctl(&self) -> u64 {
+        self.vcpu
+            .kvm_vcpu
+            .get_msrs([MSR_IA32_DEBUGCTLMSR].into_iter())
+            .ok()
+            .and_then(|msrs| msrs.get(&MSR_IA32_DEBUGCTLMSR).copied())
+            .unwrap_or(0)
+    }
+
+    fn write_debugctl(&mut self, value: u64) {
+        let msrs_to_set = [kvm_msr_entry {
+            index: MSR_IA32_DEBUGCTLMSR,
+            data: value,
+            ..Default::default()
+        }];
+        let msrs_wrapper = Msrs::from_entries(&msrs_to_set).unwrap();
+        let num_set = self.vcpu.kvm_vcpu.fd.set_msrs(&msrs_wrapper).unwrap();
+        assert_eq!(num_set, 1);
+    }
+
+    /// Configures BTS tracing and DS area pointer for the current vCPU.
+    pub fn configure_bts(&mut self, ds_area_paddr: u64, config: BtsConfig) -> Result<(), MemoryError> {
+        if (ds_area_paddr & mem::M_PAGE_OFFSET) != 0 {
+            return Err(MemoryError::UnalignedAddress(ds_area_paddr));
+        }
+        let mut debugctl = self.read_debugctl();
+        if config.enable {
+            debugctl |= DEBUGCTL_BTS;
+            if config.interrupt {
+                debugctl |= DEBUGCTL_BTINT;
+            } else {
+                debugctl &= !DEBUGCTL_BTINT;
+            }
+            if config.off_kernel {
+                debugctl |= DEBUGCTL_BTS_OFF_OS;
+            } else {
+                debugctl &= !DEBUGCTL_BTS_OFF_OS;
+            }
+            if config.off_user {
+                debugctl |= DEBUGCTL_BTS_OFF_USR;
+            } else {
+                debugctl &= !DEBUGCTL_BTS_OFF_USR;
+            }
+        } else {
+            debugctl &= !(DEBUGCTL_BTS | DEBUGCTL_BTINT | DEBUGCTL_BTS_OFF_OS | DEBUGCTL_BTS_OFF_USR);
+        }
+        let msrs_to_set = [
+            kvm_msr_entry {
+                index: MSR_IA32_DS_AREA,
+                data: ds_area_paddr,
+                ..Default::default()
+            },
+            kvm_msr_entry {
+                index: MSR_IA32_DEBUGCTLMSR,
+                data: debugctl,
+                ..Default::default()
+            },
+        ];
+        let msrs_wrapper = Msrs::from_entries(&msrs_to_set).unwrap();
+        let num_set = self.vcpu.kvm_vcpu.fd.set_msrs(&msrs_wrapper).unwrap();
+        assert_eq!(num_set, 2);
+        Ok(())
+    }
+
     pub fn set_debug_state(&mut self, run_mode: RunMode, vmexit_on_swbp: bool ){
         let mut control = KVM_GUESTDBG_ENABLE;
         if run_mode.is_step() {
@@ -565,27 +1114,13 @@ impl NyxVM {
             control |= KVM_GUESTDBG_BLOCKIRQ;
         };
         // Set or clear BTF (branch trace flag) when requested.
-        const BTF: usize = 1;
-        let mut debugctl = self
-            .vcpu
-            .kvm_vcpu
-            .get_msrs([MSR_IA32_DEBUGCTLMSR].into_iter())
-            .ok()
-            .and_then(|msrs| msrs.get(&MSR_IA32_DEBUGCTLMSR).copied())
-            .unwrap_or(0);
+        let mut debugctl = self.read_debugctl();
         if let RunMode::BranchStep = run_mode {
-            debugctl |= 1 << BTF;
+            debugctl |= DEBUGCTL_BTF;
         } else {
-            debugctl &= !(1 << BTF);
+            debugctl &= !DEBUGCTL_BTF;
         }
-        let msrs_to_set = [kvm_msr_entry {
-            index: MSR_IA32_DEBUGCTLMSR,
-            data: debugctl,
-            ..Default::default()
-        }];
-        let msrs_wrapper = Msrs::from_entries(&msrs_to_set).unwrap();
-        let num_set = self.vcpu.kvm_vcpu.fd.set_msrs(&msrs_wrapper).unwrap();
-        assert_eq!(num_set, 1);
+        self.write_debugctl(debugctl);
         control |= if vmexit_on_swbp {KVM_GUESTDBG_USE_SW_BP} else {KVM_GUESTDBG_INJECT_BP};
         let mut arch  = kvm_guest_debug_arch::default();
         if self.hw_breakpoints.any_active() {
@@ -653,6 +1188,14 @@ impl NyxVM {
             match self.vcpu.run_emulation() {
                 // Emulation ran successfully, continue.
                 Ok(VcpuEmulation::Handled) => {}
+                Ok(VcpuEmulation::DirtyRingFull) => {
+                    let vmm = self.vmm.lock().unwrap();
+                    Self::drain_dirty_ring_backlog(
+                        &vmm,
+                        &mut self.dirty_ring,
+                        &mut self.dirty_ring_backlog,
+                    );
+                }
                 // Emulation was interrupted, check external events.
                 Ok(VcpuEmulation::Interrupted) => {
                     if time::Instant::now().duration_since(start_time) >= timeout {
@@ -766,29 +1309,32 @@ impl NyxVM {
         vmm.read_virtual_cstr(cr3, guest_vaddr)
     }
     pub fn read_current_u64(&self, vaddr: u64) -> u64 {
-        let cr3 = self.sregs().cr3;
-        let vmm = self.vmm.lock().unwrap();
-        return vmm.read_virtual_u64(cr3, vaddr).unwrap();
+        self.current_process_memory()
+            .read_u64(vaddr)
+            .unwrap()
     }
     pub fn write_current_u64(&self, vaddr: u64, val: u64) {
-        let cr3 = self.sregs().cr3;
-        let vmm = self.vmm.lock().unwrap();
-        return vmm.write_virtual_u64(cr3, vaddr, val).unwrap();
+        self.current_process_memory()
+            .write_u64(vaddr, val)
+            .unwrap();
+    }
+
+    pub fn write_current_bytes(&self, vaddr: u64, buffer: &[u8]) -> usize {
+        self.current_process_memory()
+            .write_bytes(vaddr, buffer)
+            .unwrap()
     }
 
     pub fn read_current_bytes(&self, vaddr: u64, num_bytes: usize) -> Vec<u8> {
         let mut res = Vec::with_capacity(num_bytes);
-        let cr3 = self.sregs().cr3;
         res.resize(num_bytes, 0);
-        let vmm = self.vmm.lock().unwrap();
-        let bytes_copied = vmm.read_virtual_bytes(cr3, vaddr, &mut res).unwrap();
+        let bytes_copied = self
+            .current_process_memory()
+            .read_bytes(vaddr, &mut res)
+            .unwrap();
         res.truncate(bytes_copied);
-        //@TODO 
-        // It appears that we see high kernel addresses sometimes (i.e.
-        // rip = ffffffff823b1ad8 during the boot breakpoint vmexit, triggered when disassembly rip). Those aren't
-        // handled correctly right now. Investigate expected behavior
-        if vaddr < 0xffffffff00000000 {
-            assert_eq!(bytes_copied, num_bytes); 
+        if is_canonical_user_addr(vaddr) {
+            assert_eq!(bytes_copied, num_bytes);
         }
         return res;
     }

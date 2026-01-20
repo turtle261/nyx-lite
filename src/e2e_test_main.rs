@@ -16,14 +16,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use libc::{pthread_t, SIGSTOP};
 use nyx_lite::disassembly;
 use nyx_lite::mem::{NyxMemExtension, PagePermission};
 use nyx_lite::snapshot::NyxSnapshot;
-use nyx_lite::vm_continuation_statemachine::VMContinuationState;
 use nyx_lite::{ExitReason, NyxVM};
 use utils::arg_parser::{ArgParser, Argument};
-use vmm::utils::signal::Killable;
 use utils::validators::validate_instance_id;
 use vmm::logger::{error, info, LoggerConfig, LOGGER};
 
@@ -37,23 +34,6 @@ fn main() -> ExitCode {
     } else {
         info!("NYX-lite exiting successfully. exit_code=0");
         ExitCode::SUCCESS
-    }
-}
-
-struct SuspendForDebugger{}
-
-impl SuspendForDebugger{
-    pub fn now(){
-        SuspendForDebugger{}.kill(SIGSTOP).expect("failed to pause for debugger");
-    }
-}
-
-unsafe impl Killable for SuspendForDebugger{
-    fn pthread_handle(&self) -> pthread_t {
-        let pid = unsafe{libc::getpid()};
-        let target_thread = unsafe { libc::pthread_self() };
-        println!("suspending current_thread_id :{:?} in pid {:?}", target_thread, pid);
-        target_thread
     }
 }
 
@@ -505,8 +485,6 @@ pub fn test_host_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &Arc<NyxSnapsho
     };
 
     // test jumping straight ontop of a breakpoint & continue running
-    // NOTE when we change IP and don't want to miss the first breakpoint we need to reset the continueation state - TODO fix this!
-    vm.continuation_state=VMContinuationState::Main; 
     let mut regs = vm.regs();
     regs.rax = 0; // currently rax is still the hypercall value because we teleported rip - so the breakpoint would be missclassified as hypercall
     regs.rip = code_addr+8;     // +08 add rax,1     # 48 83 c0 01 *BP
@@ -523,8 +501,6 @@ pub fn test_host_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &Arc<NyxSnapsho
     };
 
     // test jumping straight ontop of a breakpoint & continue running
-    // NOTE when we change IP and don't want to miss the first breakpoint we need to reset the continueation state - TODO fix this!
-    vm.continuation_state=VMContinuationState::Main; 
     let mut regs = vm.regs();
     regs.rax = 0; // currently rax is still the hypercall value because we teleported rip - so the breakpoint would be missclassified as hypercall
     regs.rip = code_addr+8;     // +08 add rax,1     # 48 83 c0 01 *BP

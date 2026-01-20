@@ -9,3 +9,4 @@ pub mod nyx_vm;
 pub use nyx_vm::*;
 pub mod vm_continuation_statemachine;
 pub mod disassembly;
+pub mod image_builder;

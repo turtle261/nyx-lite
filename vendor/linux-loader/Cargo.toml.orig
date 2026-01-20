@@ -6,7 +6,7 @@ authors = [
     "rust-vmm AWS maintainers <rust-vmm-maintainers@amazon.com>",
     "Cathy Zhang <cathy.zhang@intel.com>"
 ]
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0 AND BSD-3-Clause"
 description = "A Linux kernel image loading crate."
 keywords = ["kernel"]

@@ -11,7 +11,8 @@ Nyx-Lite allow you to easily make firecacker/KVM VM's and perform various VMI op
 5) A convenient, consistent API to handle VM exits.  
 6) A consistent way to handle timeouts & force VM exits after a given time.
 7) It should works out of the box on most random Linux distributions with any reasonable kernel version.
-8) An easy way to turn docker files into usable vm images.
+8) An easy way to turn docker files or root directories into usable vm images.
+9) Root snapshots can be reused across VM instances to avoid reloading base state from disk.
 
 However, while nyx-lite's API & codebase is much friendlier to new usecases, there's always some tradeoffs. Unlike Nyx it's specifically designed to work on an unmodified host kernel. This obviously has some downsides: KVM does not provide all the VMI primitives we'd like to use. For example, nyx-lite doesn't support Intel-PT.     
 Additionally it's based on Firecracker instead of Qemu. While this makes the codebase MUCH smaller and easy to hack on (Firecracker is about 5% of the size of Qemu), this prevents nyx-lite from being used with closed source operating systems such as windows and mac-os that won't run inside of firecracker VMs. 
@@ -38,6 +39,8 @@ and run tests with:
 cd vm_image
 export RUST_BACKTRACE=1 && cargo build --release && pushd dockerimage && bash build-img.sh && popd && ../target/release/e2e_test --config vmconfig.json
 ```
+`dockerimage/build-img.sh` builds a statically-linked `guest_test` binary for `x86_64-unknown-linux-musl`. Install `rustup` with that target (`rustup target add x86_64-unknown-linux-musl`) or set `GUEST_TEST_BIN=/path/to/guest_test` to reuse a prebuilt binary.
+The `RootfsBuilder` API requires `docker`, `tar`, and `mke2fs` on the host.
 
 API
 ===
@@ -93,14 +96,61 @@ To get a sense of how to use
 ```
 
 If `serial_out_path` is not configured, NyxVM will create a PTY and wire the guest serial console to its slave. The PTY master is exposed via `NyxVM.serial_pty` so callers can capture output without touching stdout.
+To enable nested virtualization, set `machine-config.enable_nested_virt` in your VM config; this requires host support for nested KVM.
+
+Rootfs Builder API
+==================
+Use the `RootfsBuilder` to turn a Dockerfile or a root directory into an ext4 image:
+
+```rust
+use nyx_lite::image_builder::RootfsBuilder;
+use std::path::Path;
+
+let builder = RootfsBuilder::new("/tmp");
+builder.build_from_dockerfile(
+    Path::new("./vm_image/dockerimage/Dockerfile"),
+    Path::new("./vm_image/dockerimage"),
+    Path::new("./vm_image/dockerimage/rootfs.ext4"),
+    None,
+)?;
+
+// Or build directly from a root directory:
+builder.build_from_rootdir(
+    Path::new("./rootdir"),
+    Path::new("./rootfs.ext4"),
+    Some(512),
+)?;
+```
+
+Minimal Fuzzing Example
+=======================
+```rust
+use std::time::Duration;
+use nyx_lite::{ExitReason, NyxVM};
+
+let config = std::fs::read_to_string("vmconfig.json")?;
+let mut vm = NyxVM::new("fuzz".to_string(), &config);
+let base = vm.take_snapshot();
+
+for payload in corpus.iter() {
+    vm.apply_snapshot(&base);
+    // Provide input to the guest via shared memory or by writing directly.
+    vm.write_current_bytes(0x4000, payload);
+    match vm.run(Duration::from_millis(10)) {
+        ExitReason::ExecDone(code) => println!("exit code: {code}"),
+        ExitReason::Timeout => (),
+        other => println!("exit: {:?}", other),
+    }
+}
+```
 
 Caveats 
 =======
 Nyx-Lite is currently not a stable release - there's quite a few limitations and known issues:
-1) Performance: The rust wrapper around KVM currently only exposes the dirty bitmap and not the dirty_ring interface, and as such incremental snapshot reset performance for large VM's can be dominate by the time to walk the bitmap (This is planned to change in the future) - ditto for the firecracker host side dirty memory tracking.
-2) Performance: We currently don't allow to share root snapshots between different VM instances, and it's unclear if it's safe to make more than one VM instance per process. This limits usefullness in highly parallel settings (This is planned to change in the future)
+1) Performance: Dirty-ring tracking and host-side dirty tracking reduce incremental snapshot cost, but large VMs still incur memory bandwidth pressure on full resets.
+2) Performance: Base snapshots can be reused across VM instances, but each VM still owns its guest memory; cross-process shared root memory is not implemented.
 3) Performance: Using lots of software breakpoints will make VM Entry/Exits slow as we remove/reapply all breakpoints to allow a clean view at the memory. This should be fixed by hiding breakpoints from memory accesses to allow to use millions of breakpoints with acceptable performance.
-6) Serial output now defaults to a PTY slave when `serial_out_path` is unset; callers should read from `NyxVM.serial_pty` if they need console output. 
-5) Determinism: While using snapshots generally leads to somewhat deterministic behavior, KVM doesn't allow to make a fully deterministic VMM. In addition to not being able to easily control timing interrupts ourselfs, we can also not precisely control the value of tsc when resetting the snapshot, as KVM "helpfully" tries to account for time spend in the host, and will introduce jitter based on how long the host takes to reenter the VM. As such multithreading/highly timing sensitive applications might not behave deterministically.
-6) Network devices are currently not supported when using snapshots. While you can boot the VM with a network device to perform a setup, they won't work in snapshot, likely resulting in crashes. Ideally, we'd like to allow real world network traffic during execution, and replay it after running a snapshot.\
-7) A variety of known bugs and issues that will get fixed as we find time to address them. 
+4) Serial output now defaults to a PTY slave when `serial_out_path` is unset; callers should read from `NyxVM.serial_pty` if they need console output. 
+5) Determinism: While using snapshots generally leads to somewhat deterministic behavior, KVM doesn't allow a fully deterministic VMM. In addition to not being able to easily control timing interrupts ourselves, we can also not precisely control the value of TSC when resetting the snapshot, as KVM accounts for time spent in the host and introduces jitter based on how long the host takes to reenter the VM. Multithreading/highly timing sensitive applications might not behave deterministically.
+6) Network devices are currently not supported when using snapshots. While you can boot the VM with a network device to perform a setup, they won't work in snapshot, likely resulting in crashes. Ideally, we'd like to allow real world network traffic during execution, and replay it after running a snapshot.
+7) See `project_docs/` for any remaining issues or edge cases discovered during testing.

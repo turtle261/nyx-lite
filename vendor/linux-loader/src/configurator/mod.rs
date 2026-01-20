@@ -59,11 +59,11 @@ impl fmt::Display for Error {
         use Error::*;
         let desc = match self {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            Linux(ref _e) => "failed to configure boot parameter by Linux Boot protocol.",
+            Linux(_e) => "failed to configure boot parameter by Linux Boot protocol.",
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            Pvh(ref _e) => "failed to configure boot parameter by PVH.",
+            Pvh(_e) => "failed to configure boot parameter by PVH.",
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-            Fdt(ref _e) => "failed to configure boot parameter by FDT.",
+            Fdt(_e) => "failed to configure boot parameter by FDT.",
 
             MissingStartAddress => {
                 "boot parameter was specified without its starting address in guest memory."
@@ -81,11 +81,11 @@ impl std::error::Error for Error {
         use Error::*;
         match self {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            Linux(ref e) => Some(e),
+            Linux(e) => Some(e),
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            Pvh(ref e) => Some(e),
+            Pvh(e) => Some(e),
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-            Fdt(ref e) => Some(e),
+            Fdt(e) => Some(e),
 
             MissingStartAddress => None,
             Overflow => None,

@@ -7,10 +7,15 @@ Setup:
 
 1) Install Docker (you may or may not want to follow the installation steps in `dockerfile/install-docker.sh`, whatever
 way works for you)
-2) Run `dockerfile/build-img.sh`, this will extract a rootfs from the fockerfile. It will call initscript-fuzz-setup.sh
+2) Run `dockerfile/build-img.sh`, this will extract a rootfs from the dockerfile. It will call initscript-fuzz-setup.sh
 as part of it's init.
+   - The build step expects a statically-linked `guest_test` binary for `x86_64-unknown-linux-musl`.
+   - Install `rustup` and run `rustup target add x86_64-unknown-linux-musl`, or set `GUEST_TEST_BIN=/path/to/guest_test` before running.
 3) Run `download_kernel.sh` to download vmlinux-6.1.58 (really, any other firecracker compatible  kernel will work as well - you can also use
 the official guidelines to compile your own, if you feel like it).
 4) Run `setup_networking.sh` to setup a bridged network with the VM
 5) Run `run.sh` to actually start the VM
 6) Log into the VM via the tty, or by running `ssh-root.sh`
+
+Optional:
+- You can build `rootfs.ext4` from a Dockerfile or a root directory via `nyx_lite::image_builder::RootfsBuilder` instead of the shell script.

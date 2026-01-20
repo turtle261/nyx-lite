@@ -59,7 +59,6 @@ impl VMContinuationState{
 
     fn run_main(vm: &mut NyxVM, run_mode: RunMode, timeout: Duration) -> (Self, Option<VMExitUserEvent>){
         let vmexit_on_swbp = true;
-        //vm.reapply_skipped_bps(); TODO add this once we actually support breakpoints
         vm.set_debug_state(run_mode, vmexit_on_swbp);
         vm.breakpoint_manager.enable_all_breakpoints(&mut vm.vmm.lock().unwrap());
         let exit = vm.run_inner(timeout);
@@ -97,8 +96,7 @@ impl VMContinuationState{
                 return (Self::Main, None)
             }
             UnparsedExitReason::BadMemoryAccess => {
-                // TODO: I no longer understand what we are doing here - check this actually works
-                return (Self::ForceSingleStep, Some(VMExitUserEvent::BadMemoryAccess))
+                return (Self::Main, Some(VMExitUserEvent::BadMemoryAccess))
             }
             UnparsedExitReason::GuestBreakpoint => {
                 // To get here, we triggered a nyx-bp at address X (which we removed). IF there was a breakpoint under
@@ -142,7 +140,6 @@ impl VMContinuationState{
             }
             UnparsedExitReason::HWBreakpoint(x) => return (Self::Main, Some(VMExitUserEvent::HWBreakpoint(x))),
             UnparsedExitReason::BadMemoryAccess => {
-                // TODO: I no longer understand what we are doing here - check this actually works
                 return (Self::Main, Some(VMExitUserEvent::BadMemoryAccess))
             }
             UnparsedExitReason::GuestBreakpoint => {

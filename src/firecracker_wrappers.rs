@@ -15,6 +15,18 @@ use vmm::Vmm;
 use vmm::{EventManager, VcpuHandle};
 
 use kvm_bindings::{kvm_guest_debug, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_USE_SW_BP};
+use kvm_bindings::KVM_CAP_NESTED_STATE;
+
+#[cfg(target_arch = "x86_64")]
+use vmm::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
+#[cfg(target_arch = "x86_64")]
+use vmm::cpu_config::x86_64::cpuid::{CpuidKey, CpuidTrait, KvmCpuidFlags, VENDOR_ID_AMD, VENDOR_ID_INTEL};
+#[cfg(target_arch = "x86_64")]
+use vmm::cpu_config::x86_64::custom_cpu_template::{
+    CpuidLeafModifier, CpuidRegister, CpuidRegisterModifier, CustomCpuTemplate,
+};
+#[cfg(target_arch = "x86_64")]
+use vmm::cpu_config::templates::KvmCapability;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ResizeFdTableError {
@@ -24,6 +36,112 @@ pub enum ResizeFdTableError {
     Dup2(io::Error),
     /// Failed to close dup2'd file descriptor
     Close(io::Error),
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ensure_nested_kvm_caps(template: &mut CustomCpuTemplate) {
+    if !template.kvm_capabilities.iter().any(|cap| {
+        matches!(cap, KvmCapability::Add(value) if *value == KVM_CAP_NESTED_STATE)
+    }) {
+        template.kvm_capabilities.push(KvmCapability::Add(KVM_CAP_NESTED_STATE));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn set_cpuid_bit(
+    template: &mut CustomCpuTemplate,
+    leaf: u32,
+    subleaf: u32,
+    register: CpuidRegister,
+    bit: u8,
+) {
+    let mask = 1u32 << bit;
+    if let Some(leaf_mod) = template
+        .cpuid_modifiers
+        .iter_mut()
+        .find(|entry| entry.leaf == leaf && entry.subleaf == subleaf)
+    {
+        if let Some(reg_mod) = leaf_mod
+            .modifiers
+            .iter_mut()
+            .find(|entry| entry.register == register)
+        {
+            reg_mod.bitmap.filter |= mask;
+            reg_mod.bitmap.value |= mask;
+        } else {
+            leaf_mod.modifiers.push(CpuidRegisterModifier {
+                register,
+                bitmap: vmm::cpu_config::templates::RegisterValueFilter {
+                    filter: mask,
+                    value: mask,
+                },
+            });
+        }
+    } else {
+        template.cpuid_modifiers.push(CpuidLeafModifier {
+            leaf,
+            subleaf,
+            flags: KvmCpuidFlags::EMPTY,
+            modifiers: vec![CpuidRegisterModifier {
+                register,
+                bitmap: vmm::cpu_config::templates::RegisterValueFilter {
+                    filter: mask,
+                    value: mask,
+                },
+            }],
+        });
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ensure_nested_virt_supported(
+    kvm: &vmm::arch::x86_64::kvm::Kvm,
+    template: &mut CustomCpuTemplate,
+) -> Result<(), StartMicrovmError> {
+    if kvm.fd.check_extension_raw(u64::from(KVM_CAP_NESTED_STATE)) == 0 {
+        return Err(StartMicrovmError::NestedVirtUnsupported(
+            "KVM_CAP_NESTED_STATE not supported by host".to_string(),
+        ));
+    }
+
+    let vendor = get_vendor_id_from_host().map_err(|err| {
+        StartMicrovmError::NestedVirtUnsupported(format!(
+            "unable to read CPUID vendor: {err}"
+        ))
+    })?;
+
+    if &vendor == VENDOR_ID_INTEL {
+        let key = CpuidKey { leaf: 0x1, subleaf: 0 };
+        let entry = kvm.supported_cpuid.get(&key).ok_or_else(|| {
+            StartMicrovmError::NestedVirtUnsupported("missing CPUID leaf 0x1".to_string())
+        })?;
+        if entry.result.ecx & (1 << 5) == 0 {
+            return Err(StartMicrovmError::NestedVirtUnsupported(
+                "host CPUID does not advertise VMX support".to_string(),
+            ));
+        }
+        set_cpuid_bit(template, 0x1, 0x0, CpuidRegister::Ecx, 5);
+        Ok(())
+    } else if &vendor == VENDOR_ID_AMD {
+        let key = CpuidKey {
+            leaf: 0x8000_0001,
+            subleaf: 0,
+        };
+        let entry = kvm.supported_cpuid.get(&key).ok_or_else(|| {
+            StartMicrovmError::NestedVirtUnsupported("missing CPUID leaf 0x80000001".to_string())
+        })?;
+        if entry.result.ecx & (1 << 2) == 0 {
+            return Err(StartMicrovmError::NestedVirtUnsupported(
+                "host CPUID does not advertise SVM support".to_string(),
+            ));
+        }
+        set_cpuid_bit(template, 0x8000_0001, 0x0, CpuidRegister::Ecx, 2);
+        Ok(())
+    } else {
+        Err(StartMicrovmError::NestedVirtUnsupported(
+            "unsupported CPU vendor for nested virtualization".to_string(),
+        ))
+    }
 }
 
 /// Attempts to resize the processes file descriptor table to match RLIMIT_NOFILE or 2048 if no
@@ -125,7 +243,23 @@ pub fn build_microvm_for_boot(
     #[allow(unused_mut)]
     let mut boot_cmdline = boot_config.cmdline.clone();
 
-    let cpu_template = vm_resources.machine_config.cpu_template.get_cpu_template()?;
+    let mut cpu_template = vm_resources
+        .machine_config
+        .cpu_template
+        .get_cpu_template()?
+        .into_owned();
+    if vm_resources.machine_config.enable_nested_virt {
+        #[cfg(target_arch = "x86_64")]
+        {
+            ensure_nested_kvm_caps(&mut cpu_template);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            return Err(StartMicrovmError::NestedVirtUnsupported(
+                "nested virtualization is only supported on x86_64".to_string(),
+            ));
+        }
+    }
 
     let (mut vmm, mut vcpus) = vmm::builder::create_vmm_and_vcpus(
         instance_info,
@@ -136,6 +270,13 @@ pub fn build_microvm_for_boot(
         vm_resources.machine_config.vcpu_count,
         cpu_template.kvm_capabilities.clone(),
     )?;
+
+    if vm_resources.machine_config.enable_nested_virt {
+        #[cfg(target_arch = "x86_64")]
+        {
+            ensure_nested_virt_supported(vmm.kvm(), &mut cpu_template)?;
+        }
+    }
 
     let entry_addr = vmm::arch::load_kernel(&boot_config.kernel_file, vmm.vm.guest_memory())?;
     let initrd = InitrdConfig::from_config(boot_config, vmm.vm.guest_memory())?;

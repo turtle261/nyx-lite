@@ -26,4 +26,10 @@ pub enum MemoryError {
     CantWritePhysicalPage(GuestAddress, usize),
     #[error("page at page_table p:{:x}:{} is not present", (.0).0 ,.1)]
     PageNotPresent(GuestAddress, u64),
+    #[error("unaligned address: {0:#x}")]
+    UnalignedAddress(u64),
+    #[error("missing page table for vaddr: {0:#x}")]
+    MissingPageTable(u64),
+    #[error("unable to allocate page table for vaddr: {0:#x}")]
+    PageTableAllocationFailed(u64),
 }

@@ -83,11 +83,11 @@ impl fmt::Display for Error {
         write!(f, "Kernel Loader: ")?;
         match self {
             #[cfg(all(feature = "bzimage", any(target_arch = "x86", target_arch = "x86_64")))]
-            Error::Bzimage(ref e) => write!(f, "failed to load bzImage kernel image: {e}"),
+            Error::Bzimage(e) => write!(f, "failed to load bzImage kernel image: {e}"),
             #[cfg(all(feature = "elf", any(target_arch = "x86", target_arch = "x86_64")))]
-            Error::Elf(ref e) => write!(f, "failed to load ELF kernel image: {e}"),
+            Error::Elf(e) => write!(f, "failed to load ELF kernel image: {e}"),
             #[cfg(all(feature = "pe", any(target_arch = "aarch64", target_arch = "riscv64")))]
-            Error::Pe(ref e) => write!(f, "failed to load PE kernel image: {e}"),
+            Error::Pe(e) => write!(f, "failed to load PE kernel image: {e}"),
 
             Error::InvalidCommandLine => write!(f, "invalid command line provided"),
             Error::CommandLineCopy => write!(f, "failed writing command line to guest memory"),
@@ -102,11 +102,11 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             #[cfg(all(feature = "bzimage", any(target_arch = "x86", target_arch = "x86_64")))]
-            Error::Bzimage(ref e) => Some(e),
+            Error::Bzimage(e) => Some(e),
             #[cfg(all(feature = "elf", any(target_arch = "x86", target_arch = "x86_64")))]
-            Error::Elf(ref e) => Some(e),
+            Error::Elf(e) => Some(e),
             #[cfg(all(feature = "pe", any(target_arch = "aarch64", target_arch = "riscv64")))]
-            Error::Pe(ref e) => Some(e),
+            Error::Pe(e) => Some(e),
 
             Error::InvalidCommandLine => None,
             Error::CommandLineCopy => None,
