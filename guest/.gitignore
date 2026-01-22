@@ -1,0 +1,5 @@
+aixi_guest
+aixi_initramfs.cpio  
+guest_test_initramfs.cpio
+initramfs/
+initramfs_test/
