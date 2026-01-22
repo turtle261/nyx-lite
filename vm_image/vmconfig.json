@@ -1,17 +1,10 @@
 {
   "boot-source": {
     "kernel_image_path": "vmlinux-6.1.58",
-    "boot_args": "ro console=ttyS0 noapic reboot=k panic=1 pci=off nomodules random.trust_cpu=on"
+    "initrd_path": "../guest/aixi_initramfs.cpio",
+    "boot_args": "ro console=ttyS0 noapic reboot=k panic=1 pci=off nomodules random.trust_cpu=on init=/init quiet loglevel=3"
   },
-  "drives": [
-    {
-      "drive_id": "rootfs",
-      "path_on_host": "dockerimage/rootfs.ext4",
-      "is_root_device": true,
-      "is_read_only": false,
-      "io_engine": "Cow" 
-    }
-  ],
+  "drives": [],
   "network-interfaces": [
   ],
   "machine-config": {
