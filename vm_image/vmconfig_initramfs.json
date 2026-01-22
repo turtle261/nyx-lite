@@ -1,0 +1,13 @@
+{
+  "boot-source": {
+    "kernel_image_path": "/home/theo/dev/infotheory/nyx-lite/vm_image/vmlinux-6.1.58",
+    "initrd_path": "/home/theo/dev/infotheory/nyx-lite/guest/aixi_initramfs.cpio",
+    "boot_args": "ro console=ttyS0 noapic reboot=k panic=1 pci=off nomodules random.trust_cpu=on init=/init loglevel=7"
+  },
+  "drives": [],
+  "network-interfaces": [],
+  "machine-config": {
+    "vcpu_count": 1,
+    "mem_size_mib": 1024
+  }
+}
