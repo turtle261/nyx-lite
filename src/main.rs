@@ -15,13 +15,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use nyx_lite::firecracker_wrappers::{resize_fdtable, ResizeFdTableError};
+use nyx_lite::firecracker_wrappers::{ResizeFdTableError, resize_fdtable};
 use nyx_lite::{ExitReason, NyxVM};
 use utils::arg_parser::{ArgParser, Argument};
 use utils::validators::validate_instance_id;
-use vmm::logger::{debug, error, info, LoggerConfig, LOGGER};
+use vmm::logger::{LOGGER, LoggerConfig, debug, error, info};
 use vmm::signal_handler::register_signal_handlers;
-use vmm::vmm_config::metrics::{init_metrics, MetricsConfig};
+use vmm::vmm_config::metrics::{MetricsConfig, init_metrics};
 
 fn main() -> ExitCode {
     let result = main_exec();
@@ -155,7 +155,10 @@ fn main_exec() -> Result<()> {
                 println!("execution timed out");
             }
             ExitReason::Hypercall(num, arg1, arg2, arg3, arg4) => {
-                println!("got hypercall {:x}({:x}, {:x} {:x} {:x}])", num, arg1, arg2, arg3, arg4);
+                println!(
+                    "got hypercall {:x}({:x}, {:x} {:x} {:x}])",
+                    num, arg1, arg2, arg3, arg4
+                );
             }
             ExitReason::RequestSnapshot => {
                 snapshot = Some(vm.take_snapshot());
@@ -177,7 +180,7 @@ fn main_exec() -> Result<()> {
                     name, saddr, size
                 );
                 println!("Found: {:x}", vm.read_current_u64(saddr));
-                shared_vaddr= saddr;
+                shared_vaddr = saddr;
             }
             ExitReason::Shutdown => {
                 println!(">>> HYPERCALL SHUTDOWN");

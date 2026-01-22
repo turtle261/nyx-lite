@@ -2,36 +2,38 @@ use std::time::Duration;
 
 use event_manager::{EventOps, EventSet, Events, MutEventSubscriber};
 use timerfd::{SetTimeFlags, TimerFd, TimerState};
-use vmm::utils::signal::{sigrtmin, Killable};
+use vmm::utils::signal::{Killable, sigrtmin};
 use vmm::vstate::vcpu::VCPU_RTSIG_OFFSET;
 
 use libc::pthread_t;
 
-pub struct TimerEvent{
+pub struct TimerEvent {
     timer: TimerFd,
     target_thread: pthread_t,
 }
 
-impl TimerEvent{
-    pub fn new() -> Self{
-
-
+impl TimerEvent {
+    pub fn new() -> Self {
         // Send the SIGTERM signal to the current thread that makes the TimerEvent
         let target_thread = unsafe { libc::pthread_self() };
         println!("current_thread_id :{:?}", target_thread);
 
-        Self{timer: TimerFd::new().unwrap(), target_thread}
-    }
-    pub fn set_timeout(&mut self, timeout: Duration) {
-        if timeout != Duration::MAX{
-            self.timer.set_state(TimerState::Oneshot(timeout), SetTimeFlags::Default);
+        Self {
+            timer: TimerFd::new().unwrap(),
+            target_thread,
         }
     }
-    pub fn disable(&mut self){
-        self.timer.set_state(TimerState::Disarmed, SetTimeFlags::Default);
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        if timeout != Duration::MAX {
+            self.timer
+                .set_state(TimerState::Oneshot(timeout), SetTimeFlags::Default);
+        }
+    }
+    pub fn disable(&mut self) {
+        self.timer
+            .set_state(TimerState::Disarmed, SetTimeFlags::Default);
     }
 }
-
 
 impl MutEventSubscriber for TimerEvent {
     // Handle an event for queue or rate limiter.
@@ -46,16 +48,14 @@ impl MutEventSubscriber for TimerEvent {
                 event_set, source
             );
         }
-        self.timer.set_state(TimerState::Disarmed, SetTimeFlags::Default);
+        self.timer
+            .set_state(TimerState::Disarmed, SetTimeFlags::Default);
         let sig_num_kick = sigrtmin() + VCPU_RTSIG_OFFSET;
         self.kill(sig_num_kick).unwrap();
     }
 
     fn init(&mut self, ops: &mut EventOps) {
-        ops.add(Events::new(
-            &self.timer,
-            EventSet::IN,
-        )).unwrap();
+        ops.add(Events::new(&self.timer, EventSet::IN)).unwrap();
     }
 }
 
@@ -64,7 +64,7 @@ impl MutEventSubscriber for TimerEvent {
 // be mostly true. However, if the user was making multiple VM objects in
 // multiple threads, this might no longer be true - it's unclear how the timer
 // event would be drop'ed for now. So this is probably actually not safe.
-unsafe impl Killable for TimerEvent{
+unsafe impl Killable for TimerEvent {
     fn pthread_handle(&self) -> pthread_t {
         self.target_thread
     }

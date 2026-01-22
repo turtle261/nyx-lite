@@ -4,29 +4,31 @@ use std::{io, thread};
 use anyhow::Result;
 
 use event_manager::SubscriberOps;
+use vmm::Vcpu;
+use vmm::Vmm;
 use vmm::builder::StartMicrovmError;
 use vmm::cpu_config::templates::GetCpuTemplate;
 use vmm::initrd::InitrdConfig;
 use vmm::resources::VmResources;
 use vmm::vmm_config::instance_info::InstanceInfo;
 use vmm::vstate::memory;
-use vmm::Vcpu;
-use vmm::Vmm;
 use vmm::{EventManager, VcpuHandle};
 
-use kvm_bindings::{kvm_guest_debug, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_USE_SW_BP};
 use kvm_bindings::KVM_CAP_NESTED_STATE;
+use kvm_bindings::{KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_USE_SW_BP, kvm_guest_debug};
 
+#[cfg(target_arch = "x86_64")]
+use vmm::cpu_config::templates::KvmCapability;
 #[cfg(target_arch = "x86_64")]
 use vmm::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
 #[cfg(target_arch = "x86_64")]
-use vmm::cpu_config::x86_64::cpuid::{CpuidKey, CpuidTrait, KvmCpuidFlags, VENDOR_ID_AMD, VENDOR_ID_INTEL};
+use vmm::cpu_config::x86_64::cpuid::{
+    CpuidKey, CpuidTrait, KvmCpuidFlags, VENDOR_ID_AMD, VENDOR_ID_INTEL,
+};
 #[cfg(target_arch = "x86_64")]
 use vmm::cpu_config::x86_64::custom_cpu_template::{
     CpuidLeafModifier, CpuidRegister, CpuidRegisterModifier, CustomCpuTemplate,
 };
-#[cfg(target_arch = "x86_64")]
-use vmm::cpu_config::templates::KvmCapability;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ResizeFdTableError {
@@ -40,10 +42,14 @@ pub enum ResizeFdTableError {
 
 #[cfg(target_arch = "x86_64")]
 fn ensure_nested_kvm_caps(template: &mut CustomCpuTemplate) {
-    if !template.kvm_capabilities.iter().any(|cap| {
-        matches!(cap, KvmCapability::Add(value) if *value == KVM_CAP_NESTED_STATE)
-    }) {
-        template.kvm_capabilities.push(KvmCapability::Add(KVM_CAP_NESTED_STATE));
+    if !template
+        .kvm_capabilities
+        .iter()
+        .any(|cap| matches!(cap, KvmCapability::Add(value) if *value == KVM_CAP_NESTED_STATE))
+    {
+        template
+            .kvm_capabilities
+            .push(KvmCapability::Add(KVM_CAP_NESTED_STATE));
     }
 }
 
@@ -105,13 +111,14 @@ fn ensure_nested_virt_supported(
     }
 
     let vendor = get_vendor_id_from_host().map_err(|err| {
-        StartMicrovmError::NestedVirtUnsupported(format!(
-            "unable to read CPUID vendor: {err}"
-        ))
+        StartMicrovmError::NestedVirtUnsupported(format!("unable to read CPUID vendor: {err}"))
     })?;
 
     if &vendor == VENDOR_ID_INTEL {
-        let key = CpuidKey { leaf: 0x1, subleaf: 0 };
+        let key = CpuidKey {
+            leaf: 0x1,
+            subleaf: 0,
+        };
         let entry = kvm.supported_cpuid.get(&key).ok_or_else(|| {
             StartMicrovmError::NestedVirtUnsupported("missing CPUID leaf 0x1".to_string())
         })?;
@@ -229,8 +236,12 @@ pub fn build_microvm_for_boot(
     // that would not be worth the effort.
     let regions = vmm::arch::arch_memory_regions(vm_resources.machine_config.mem_size_mib << 20);
     let guest_regions = if vhost_user_device_used {
-        memory::memfd_backed(&regions, track_dirty_pages, vm_resources.machine_config.huge_pages)
-            .map_err(StartMicrovmError::GuestMemory)?
+        memory::memfd_backed(
+            &regions,
+            track_dirty_pages,
+            vm_resources.machine_config.huge_pages,
+        )
+        .map_err(StartMicrovmError::GuestMemory)?
     } else {
         memory::anonymous(
             regions.iter().copied(),

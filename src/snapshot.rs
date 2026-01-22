@@ -4,29 +4,28 @@ use vmm::persist::MicrovmState;
 
 use crate::{mem::PAGE_SIZE, vm_continuation_statemachine::VMContinuationState};
 
-#[derive(Debug,Eq,PartialEq, Hash, Clone, Copy)]
-pub enum SnapshotType{
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
+pub enum SnapshotType {
     Incremental,
-    Base
+    Base,
 }
 
 pub struct BaseRegionSnapshot {
     pub start: u64,
     pub data: Arc<[u8]>,
 }
-pub enum MemorySnapshot{
+pub enum MemorySnapshot {
     Base(Vec<BaseRegionSnapshot>),
     Incremental(HashMap<u64, Vec<u8>>),
 }
 
-impl MemorySnapshot{
-
+impl MemorySnapshot {
     pub fn is_incremental(&self) -> bool {
         matches!(self, Self::Incremental(_))
     }
 
     pub fn get_page(&self, paddr: usize) -> Option<&[u8]> {
-        match self{
+        match self {
             MemorySnapshot::Base(regions) => {
                 let paddr = paddr as u64;
                 for region in regions {
@@ -43,7 +42,7 @@ impl MemorySnapshot{
                 }
                 None
             }
-            MemorySnapshot::Incremental(map) => map.get(&(paddr as u64)).map(|v| v.as_ref())
+            MemorySnapshot::Incremental(map) => map.get(&(paddr as u64)).map(|v| v.as_ref()),
         }
     }
 }
@@ -54,23 +53,29 @@ pub struct NyxSnapshot {
     pub memory: MemorySnapshot,
     pub state: MicrovmState,
     pub tsc: u64,
-    pub continuation_state: VMContinuationState
+    pub continuation_state: VMContinuationState,
 }
 
-impl NyxSnapshot{
-    pub fn get_page<Callback>(&self, paddr: usize, mut callback: Callback) where Callback: FnMut(&[u8; PAGE_SIZE as usize]){
+impl NyxSnapshot {
+    pub fn get_page<Callback>(&self, paddr: usize, mut callback: Callback)
+    where
+        Callback: FnMut(&[u8; PAGE_SIZE as usize]),
+    {
         if let Some(page) = self.memory.get_page(paddr) {
             return callback(page.try_into().unwrap());
         }
         assert!(self.memory.is_incremental());
         assert!(self.parent.is_some());
-        self.parent.as_ref().expect("Incremental Snapshots should always have a parent").get_page(paddr, callback)
+        self.parent
+            .as_ref()
+            .expect("Incremental Snapshots should always have a parent")
+            .get_page(paddr, callback)
     }
 
     pub fn iter_delta(&self) -> impl Iterator<Item = (u64, &Vec<u8>)> {
-       if let MemorySnapshot::Incremental(ref map) = self.memory {
-        return map.iter().map(|(p,s)| (*p,s))
-       }
-       panic!("can't iter delta on a root snapshot");
+        if let MemorySnapshot::Incremental(ref map) = self.memory {
+            return map.iter().map(|(p, s)| (*p, s));
+        }
+        panic!("can't iter delta on a root snapshot");
     }
 }

@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-pub use crate::nyx_vm::NyxVM;
 use crate::UnparsedExitReason;
+pub use crate::nyx_vm::NyxVM;
 
-#[derive(Clone,Debug,Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum VMExitUserEvent {
     Shutdown,
     Hypercall,
@@ -15,22 +15,22 @@ pub enum VMExitUserEvent {
     BadMemoryAccess,
 }
 
-#[derive(Clone,Debug,Eq, PartialEq, Hash)]
-pub enum VMContinuationState{
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum VMContinuationState {
     Main,
     ForceSingleStep,
     EmulateHypercall,
     ForceSingleStepInjectBPs,
 }
 
-#[derive(Clone,Copy,Debug,Eq, PartialEq, Hash)]
-pub enum RunMode{
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum RunMode {
     Run,
     SingleStep,
-    BranchStep
+    BranchStep,
 }
 
-impl RunMode{
+impl RunMode {
     pub fn is_step(&self) -> bool {
         match self {
             RunMode::Run => false,
@@ -40,11 +40,11 @@ impl RunMode{
     }
 }
 
-impl VMContinuationState{
-    pub fn step(vm: &mut NyxVM, run_mode: RunMode, timeout: Duration) -> VMExitUserEvent{
-        loop{
+impl VMContinuationState {
+    pub fn step(vm: &mut NyxVM, run_mode: RunMode, timeout: Duration) -> VMExitUserEvent {
+        loop {
             //println!("LOOP {:?} requested singlestep {}", vm.continuation_state, single_step);
-            let (new_state,res) = match vm.continuation_state{
+            let (new_state, res) = match vm.continuation_state {
                 Self::Main => Self::run_main(vm, run_mode, timeout),
                 Self::ForceSingleStep => Self::force_ss(vm, run_mode.is_step()),
                 Self::ForceSingleStepInjectBPs => Self::force_ss_inject_bps(vm),
@@ -57,29 +57,45 @@ impl VMContinuationState{
         }
     }
 
-    fn run_main(vm: &mut NyxVM, run_mode: RunMode, timeout: Duration) -> (Self, Option<VMExitUserEvent>){
+    fn run_main(
+        vm: &mut NyxVM,
+        run_mode: RunMode,
+        timeout: Duration,
+    ) -> (Self, Option<VMExitUserEvent>) {
         let vmexit_on_swbp = true;
         vm.set_debug_state(run_mode, vmexit_on_swbp);
-        vm.breakpoint_manager.enable_all_breakpoints(&mut vm.vmm.lock().unwrap());
+        vm.breakpoint_manager
+            .enable_all_breakpoints(&mut vm.vmm.lock().unwrap());
         let exit = vm.run_inner(timeout);
         match exit {
-            UnparsedExitReason::BadMemoryAccess => return (Self::Main, Some(VMExitUserEvent::BadMemoryAccess)),
-            UnparsedExitReason::HWBreakpoint(x) => return (Self::Main, Some(VMExitUserEvent::HWBreakpoint(x))),
+            UnparsedExitReason::BadMemoryAccess => {
+                return (Self::Main, Some(VMExitUserEvent::BadMemoryAccess));
+            }
+            UnparsedExitReason::HWBreakpoint(x) => {
+                return (Self::Main, Some(VMExitUserEvent::HWBreakpoint(x)));
+            }
             UnparsedExitReason::GuestBreakpoint => return (Self::ForceSingleStepInjectBPs, None),
-            UnparsedExitReason::NyxBreakpoint => return (Self::ForceSingleStep, Some(VMExitUserEvent::Breakpoint)),
-            UnparsedExitReason::Hypercall => return  (Self::EmulateHypercall, Some(VMExitUserEvent::Hypercall)),
+            UnparsedExitReason::NyxBreakpoint => {
+                return (Self::ForceSingleStep, Some(VMExitUserEvent::Breakpoint));
+            }
+            UnparsedExitReason::Hypercall => {
+                return (Self::EmulateHypercall, Some(VMExitUserEvent::Hypercall));
+            }
             UnparsedExitReason::Interrupted => return (Self::Main, None),
             UnparsedExitReason::Shutdown => return (Self::Main, Some(VMExitUserEvent::Shutdown)),
             UnparsedExitReason::SingleStep => {
-                if run_mode.is_step() { 
-                    return (Self::Main, Some(VMExitUserEvent::SingleStep))
+                if run_mode.is_step() {
+                    return (Self::Main, Some(VMExitUserEvent::SingleStep));
                 }
                 panic!("We shouldn't see singlestep exceptions unless we asked for them");
             }
             UnparsedExitReason::Timeout => return (Self::Main, Some(VMExitUserEvent::Timeout)),
         };
     }
-    fn force_ss(vm: &mut NyxVM, user_requested_singlestep: bool) -> (Self,Option<VMExitUserEvent>){
+    fn force_ss(
+        vm: &mut NyxVM,
+        user_requested_singlestep: bool,
+    ) -> (Self, Option<VMExitUserEvent>) {
         let vmexit_on_swbp = true;
         vm.set_debug_state(RunMode::SingleStep, vmexit_on_swbp);
         vm.disable_last_nyx_breakpoint(); // step over the nyx breakpoint(s)
@@ -89,14 +105,14 @@ impl VMContinuationState{
             UnparsedExitReason::SingleStep => {
                 // happy case: we just got to single step & can now reapply
                 // breakpoints and continue as is
-                Self::assert_made_progress(vm); 
-                if user_requested_singlestep{
-                    return (Self::Main, Some(VMExitUserEvent::SingleStep))
+                Self::assert_made_progress(vm);
+                if user_requested_singlestep {
+                    return (Self::Main, Some(VMExitUserEvent::SingleStep));
                 }
-                return (Self::Main, None)
+                return (Self::Main, None);
             }
             UnparsedExitReason::BadMemoryAccess => {
-                return (Self::Main, Some(VMExitUserEvent::BadMemoryAccess))
+                return (Self::Main, Some(VMExitUserEvent::BadMemoryAccess));
             }
             UnparsedExitReason::GuestBreakpoint => {
                 // To get here, we triggered a nyx-bp at address X (which we removed). IF there was a breakpoint under
@@ -104,7 +120,9 @@ impl VMContinuationState{
                 Self::assert_made_no_progress(vm);
                 return (Self::ForceSingleStepInjectBPs, None);
             }
-            UnparsedExitReason::HWBreakpoint(x) => return (Self::Main, Some(VMExitUserEvent::HWBreakpoint(x))),
+            UnparsedExitReason::HWBreakpoint(x) => {
+                return (Self::Main, Some(VMExitUserEvent::HWBreakpoint(x)));
+            }
             UnparsedExitReason::NyxBreakpoint => {
                 //To get here, we triggered a nyx-bp at address X. Then we removed the breakpoints from that address.
                 //Singlestep shouldn't trigger the next instruction. So IF we trigger a breakpoint ad X, AFTER we
@@ -116,55 +134,70 @@ impl VMContinuationState{
                 // as EmualteHypercall will emulate single stepping past the
                 // hypercall instruction
                 Self::assert_made_no_progress(vm);
-                return  (Self::EmulateHypercall, Some(VMExitUserEvent::Hypercall));
+                return (Self::EmulateHypercall, Some(VMExitUserEvent::Hypercall));
             }
             UnparsedExitReason::Interrupted => return (Self::ForceSingleStep, None),
             UnparsedExitReason::Shutdown => return (Self::Main, Some(VMExitUserEvent::Shutdown)),
-            UnparsedExitReason::Timeout => return (Self::ForceSingleStep, Some(VMExitUserEvent::Timeout)),
+            UnparsedExitReason::Timeout => {
+                return (Self::ForceSingleStep, Some(VMExitUserEvent::Timeout));
+            }
         };
     }
 
-
-    fn force_ss_inject_bps(vm: &mut NyxVM) -> (Self,Option<VMExitUserEvent>){
+    fn force_ss_inject_bps(vm: &mut NyxVM) -> (Self, Option<VMExitUserEvent>) {
         let vmexit_on_swbp = false;
         vm.set_debug_state(RunMode::SingleStep, vmexit_on_swbp);
-        vm.breakpoint_manager.disable_all_breakpoints(&mut vm.vmm.lock().unwrap()); // step over nyx breakpoint(s), but not guest breakpoints
+        vm.breakpoint_manager
+            .disable_all_breakpoints(&mut vm.vmm.lock().unwrap()); // step over nyx breakpoint(s), but not guest breakpoints
         let no_timeout = Duration::MAX;
         let exit = vm.run_inner(no_timeout);
         match exit {
             UnparsedExitReason::SingleStep => {
                 // happy case: we just got to single step & can now reapply
                 // breakpoints and continue as is
-                Self::assert_made_progress(vm); 
-                return (Self::Main, None)
+                Self::assert_made_progress(vm);
+                return (Self::Main, None);
             }
-            UnparsedExitReason::HWBreakpoint(x) => return (Self::Main, Some(VMExitUserEvent::HWBreakpoint(x))),
+            UnparsedExitReason::HWBreakpoint(x) => {
+                return (Self::Main, Some(VMExitUserEvent::HWBreakpoint(x)));
+            }
             UnparsedExitReason::BadMemoryAccess => {
-                return (Self::Main, Some(VMExitUserEvent::BadMemoryAccess))
+                return (Self::Main, Some(VMExitUserEvent::BadMemoryAccess));
             }
             UnparsedExitReason::GuestBreakpoint => {
-                panic!("We should never see a breakpoint based vm exit while injecting breakpoints interrupts");
+                panic!(
+                    "We should never see a breakpoint based vm exit while injecting breakpoints interrupts"
+                );
             }
             UnparsedExitReason::NyxBreakpoint => {
-                panic!("We should never see a breakpoint based vm exit while injecting breakpoints interrupts");
+                panic!(
+                    "We should never see a breakpoint based vm exit while injecting breakpoints interrupts"
+                );
             }
             UnparsedExitReason::Hypercall => {
-                panic!("We should never see a breakpoint based vm exit while injecting breakpoints interrupts");
+                panic!(
+                    "We should never see a breakpoint based vm exit while injecting breakpoints interrupts"
+                );
             }
             UnparsedExitReason::Interrupted => return (Self::ForceSingleStepInjectBPs, None),
             UnparsedExitReason::Shutdown => return (Self::Main, Some(VMExitUserEvent::Shutdown)),
-            UnparsedExitReason::Timeout => return (Self::ForceSingleStepInjectBPs, Some(VMExitUserEvent::Timeout)),
+            UnparsedExitReason::Timeout => {
+                return (
+                    Self::ForceSingleStepInjectBPs,
+                    Some(VMExitUserEvent::Timeout),
+                );
+            }
         };
     }
-    fn emulate_hypercall(vm: &mut NyxVM) -> (Self,Option<VMExitUserEvent>){
+    fn emulate_hypercall(vm: &mut NyxVM) -> (Self, Option<VMExitUserEvent>) {
         let mut regs = vm.regs();
         regs.rax = 0; // reset rax to prevent us from accidentially misinterpreting int 3 as hypercall in the future.
         regs.rip += 1;
         vm.set_regs(&regs);
         return (Self::Main, None);
     }
-    fn assert_made_progress(_vm: &mut NyxVM){
+    fn assert_made_progress(_vm: &mut NyxVM) {
         // note: needs to handle self loops, str instructions etc
     }
-    fn assert_made_no_progress(_vm: &mut NyxVM){}
+    fn assert_made_no_progress(_vm: &mut NyxVM) {}
 }

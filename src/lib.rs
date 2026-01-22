@@ -1,12 +1,12 @@
+pub mod breakpoints;
 pub mod error;
 pub mod firecracker_wrappers;
-pub mod mem;
-pub mod timer_event;
-pub mod breakpoints;
 pub mod hw_breakpoints;
-pub mod snapshot;
+pub mod mem;
 pub mod nyx_vm;
+pub mod snapshot;
+pub mod timer_event;
 pub use nyx_vm::*;
-pub mod vm_continuation_statemachine;
 pub mod disassembly;
 pub mod image_builder;
+pub mod vm_continuation_statemachine;

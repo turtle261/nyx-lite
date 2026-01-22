@@ -2,17 +2,21 @@ use core::fmt;
 use std::ffi::c_void;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
-use std::{iter::Peekable, marker::PhantomData, ops::Range, sync::atomic::{AtomicU64, Ordering}};
+use std::{
+    iter::Peekable,
+    marker::PhantomData,
+    ops::Range,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::error::MemoryError;
-use libc::{mprotect, PROT_READ, PROT_WRITE};
+use libc::{PROT_READ, PROT_WRITE, mprotect};
 use vm_memory::bitmap::BS;
 use vm_memory::{AtomicAccess, ByteValued, GuestUsize, VolatileSlice};
-use vmm::vstate::memory::{
-    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
-    GuestRegionMmap
-};
 use vmm::Vmm;
+use vmm::vstate::memory::{
+    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
+};
 
 type MResult<T> = Result<T, MemoryError>;
 pub const M_PAGE_ALIGN: u64 = 0xffff_ffff_ffff_f000;
@@ -62,10 +66,7 @@ impl HostDirtyTracker {
             return;
         }
         let mut addr = start & M_PAGE_ALIGN;
-        let end = start
-            .checked_add(len as u64 - 1)
-            .unwrap_or(u64::MAX)
-            & M_PAGE_ALIGN;
+        let end = start.checked_add(len as u64 - 1).unwrap_or(u64::MAX) & M_PAGE_ALIGN;
         while addr <= end {
             self.mark_page(addr);
             if let Some(next) = addr.checked_add(PAGE_SIZE) {
@@ -339,7 +340,8 @@ where
                 if mapping.user {
                     flags |= BIT_PTE_USER;
                 }
-                self.backend.write_phys_u64(entry_addr, new_page.0 | flags)?;
+                self.backend
+                    .write_phys_u64(entry_addr, new_page.0 | flags)?;
                 table = new_page.0;
             } else {
                 table = entry & M_PTE_PADDR;
@@ -408,10 +410,7 @@ where
             return;
         }
         let start = vaddr & M_PAGE_ALIGN;
-        let end = vaddr
-            .checked_add(len as u64 - 1)
-            .unwrap_or(u64::MAX)
-            & M_PAGE_ALIGN;
+        let end = vaddr.checked_add(len as u64 - 1).unwrap_or(u64::MAX) & M_PAGE_ALIGN;
         let mut cur = start;
         while cur <= end {
             if let Ok(paddr) = self.backend.resolve_vaddr(self.cr3, cur) {
@@ -497,18 +496,24 @@ where
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match pos {
             SeekFrom::Start(offset) => self.addr = offset,
-            SeekFrom::Current(offset) => {
-                match self.addr.checked_add_signed(offset){
-                    Some(new) => self.addr = new,
-                    None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Offset caused address Over/Underflow"))
+            SeekFrom::Current(offset) => match self.addr.checked_add_signed(offset) {
+                Some(new) => self.addr = new,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Offset caused address Over/Underflow",
+                    ));
                 }
-            }
-            SeekFrom::End(offset) => {
-                match checked_sub_signed(u64::MAX, offset){
-                    Some(new) => self.addr = new,
-                    None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Offset caused address Over/Underflow"))
+            },
+            SeekFrom::End(offset) => match checked_sub_signed(u64::MAX, offset) {
+                Some(new) => self.addr = new,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Offset caused address Over/Underflow",
+                    ));
                 }
-            }
+            },
         }
         Ok(self.addr)
     }
@@ -557,32 +562,41 @@ pub fn read_phys<T: ByteValued + AtomicAccess>(mem: &GuestMemoryMmap, paddr: u64
         .map_err(|_| MemoryError::CantReadPhysicalPage(GuestAddress(paddr), size));
 }
 
-pub fn write_phys<T: ByteValued + AtomicAccess>(mem: &GuestMemoryMmap, paddr: u64, val: T)-> MResult<()>{
+pub fn write_phys<T: ByteValued + AtomicAccess>(
+    mem: &GuestMemoryMmap,
+    paddr: u64,
+    val: T,
+) -> MResult<()> {
     let size = std::mem::size_of::<T>();
     assert!(paddr & M_PAGE_OFFSET <= PAGE_SIZE - (size as u64));
-    return mem.store(val, GuestAddress(paddr), Ordering::Relaxed)
+    return mem
+        .store(val, GuestAddress(paddr), Ordering::Relaxed)
         .map_err(|_| MemoryError::CantWritePhysicalPage(GuestAddress(paddr), size));
 }
 
-pub fn read_phys_u64(mem: &GuestMemoryMmap, paddr: u64) -> MResult<u64>{
+pub fn read_phys_u64(mem: &GuestMemoryMmap, paddr: u64) -> MResult<u64> {
     return read_phys(mem, paddr);
 }
 pub fn read_phys_u8(mem: &GuestMemoryMmap, paddr: u64) -> MResult<u8> {
-    return read_phys(mem, paddr)
+    return read_phys(mem, paddr);
 }
 
-pub enum PagePermission{
+pub enum PagePermission {
     R,
     W,
     RW,
     None,
 }
 
-
-pub trait NyxMemExtension{
+pub trait NyxMemExtension {
     fn resolve_vaddr(&self, cr3: u64, vaddr: u64) -> MResult<GuestAddress>;
     fn read_virtual<T: ByteValued + AtomicAccess>(&self, cr3: u64, vaddr: u64) -> MResult<T>;
-    fn write_virtual<T: ByteValued + AtomicAccess>(&self, cr3: u64, vaddr: u64, val: T) -> MResult<()>;
+    fn write_virtual<T: ByteValued + AtomicAccess>(
+        &self,
+        cr3: u64,
+        vaddr: u64,
+        val: T,
+    ) -> MResult<()>;
 
     fn read_phys<T: ByteValued + AtomicAccess>(&self, paddr: u64) -> MResult<T>;
     fn write_phys<T: ByteValued + AtomicAccess>(&self, paddr: u64, val: T) -> MResult<()>;
@@ -596,32 +610,37 @@ pub trait NyxMemExtension{
     fn write_virtual_u64(&self, cr3: u64, vaddr: u64, val: u64) -> MResult<()>;
     fn read_virtual_cstr(&self, cr3: u64, guest_vaddr: u64) -> Vec<u8>;
 
-    fn read_virtual_bytes(&self, cr3: u64, vaddr: u64, buffer: &mut[u8]) -> MResult<usize>;
+    fn read_virtual_bytes(&self, cr3: u64, vaddr: u64, buffer: &mut [u8]) -> MResult<usize>;
     fn write_virtual_bytes(&self, cr3: u64, guest_vaddr: u64, buffer: &[u8]) -> MResult<usize>;
 }
 
-pub trait GetMem{
+pub trait GetMem {
     fn get_mem(&self) -> &GuestMemoryMmap;
 }
 
-impl GetMem for Vmm{
+impl GetMem for Vmm {
     fn get_mem(&self) -> &GuestMemoryMmap {
         self.vm.guest_memory()
     }
 }
 
-impl<GetMemT> NyxMemExtension for GetMemT where GetMemT: GetMem{
-    fn read_virtual_cstr(&self, cr3: u64, guest_vaddr: u64) -> Vec<u8>{
+impl<GetMemT> NyxMemExtension for GetMemT
+where
+    GetMemT: GetMem,
+{
+    fn read_virtual_cstr(&self, cr3: u64, guest_vaddr: u64) -> Vec<u8> {
         let mem = self.get_mem();
         let mut res = Vec::new();
         let mut cur_addr = guest_vaddr;
-        for pte in walk_virtual_pages(mem, cr3, guest_vaddr&M_PAGE_ALIGN, M_PAGE_ALIGN){
+        for pte in walk_virtual_pages(mem, cr3, guest_vaddr & M_PAGE_ALIGN, M_PAGE_ALIGN) {
             if !pte.present() || pte.missing_page() {
                 return res;
             }
             let slice = mem.get_slice(pte.phys_addr(), PAGE_SIZE as usize).unwrap();
             while cur_addr < pte.vaddrs.end {
-                let u8_char = slice.load::<u8>((cur_addr&M_PAGE_OFFSET) as usize, Ordering::Relaxed).unwrap();
+                let u8_char = slice
+                    .load::<u8>((cur_addr & M_PAGE_OFFSET) as usize, Ordering::Relaxed)
+                    .unwrap();
                 res.push(u8_char);
                 cur_addr += 1;
                 if u8_char == 0 {
@@ -632,7 +651,7 @@ impl<GetMemT> NyxMemExtension for GetMemT where GetMemT: GetMem{
         return res;
     }
 
-    fn resolve_vaddr(&self, cr3: u64, vaddr: u64) -> MResult<GuestAddress>{
+    fn resolve_vaddr(&self, cr3: u64, vaddr: u64) -> MResult<GuestAddress> {
         let mem = self.get_mem();
         let paddr = resolve_vaddr(mem, cr3, vaddr)?;
         return Ok(GuestAddress(paddr));
@@ -648,33 +667,43 @@ impl<GetMemT> NyxMemExtension for GetMemT where GetMemT: GetMem{
         write_phys(mem, paddr, val)
     }
 
-    fn read_virtual<T: ByteValued + AtomicAccess>(&self, cr3: u64, vaddr: u64) -> MResult<T>{
+    fn read_virtual<T: ByteValued + AtomicAccess>(&self, cr3: u64, vaddr: u64) -> MResult<T> {
         let mem = self.get_mem();
         let paddr = resolve_vaddr(mem, cr3, vaddr)?;
-        return read_phys(mem, paddr)
+        return read_phys(mem, paddr);
     }
 
-    fn write_virtual<T: ByteValued + AtomicAccess>(&self, cr3: u64, vaddr: u64, value: T) -> MResult<()>{
+    fn write_virtual<T: ByteValued + AtomicAccess>(
+        &self,
+        cr3: u64,
+        vaddr: u64,
+        value: T,
+    ) -> MResult<()> {
         let mem = self.get_mem();
         let paddr = resolve_vaddr(mem, cr3, vaddr)?;
-        return write_phys(mem, paddr, value)
+        return write_phys(mem, paddr, value);
     }
 
-    fn read_virtual_u64(&self, cr3: u64, vaddr: u64) -> MResult<u64>{
+    fn read_virtual_u64(&self, cr3: u64, vaddr: u64) -> MResult<u64> {
         return self.read_virtual(cr3, vaddr);
     }
 
-    fn write_virtual_u64(&self, cr3: u64, vaddr: u64, val: u64) -> MResult<()>{
-        return self.write_virtual(cr3, vaddr, val)
+    fn write_virtual_u64(&self, cr3: u64, vaddr: u64, val: u64) -> MResult<()> {
+        return self.write_virtual(cr3, vaddr, val);
     }
     fn read_virtual_u8(&self, cr3: u64, vaddr: u64) -> MResult<u8> {
         return self.read_virtual(cr3, vaddr);
     }
-    fn write_virtual_u8(&self, cr3: u64, vaddr: u64, val: u8) -> MResult<()>{
+    fn write_virtual_u8(&self, cr3: u64, vaddr: u64, val: u8) -> MResult<()> {
         return self.write_virtual(cr3, vaddr, val);
     }
 
-    fn read_virtual_bytes<'buffer>(&self, cr3: u64, guest_vaddr: u64, buffer: &'buffer mut[u8]) -> MResult<usize> {
+    fn read_virtual_bytes<'buffer>(
+        &self,
+        cr3: u64,
+        guest_vaddr: u64,
+        buffer: &'buffer mut [u8],
+    ) -> MResult<usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
@@ -689,8 +718,15 @@ impl<GetMemT> NyxMemExtension for GetMemT where GetMemT: GetMem{
             let guest_slice = mem.get_slice(pte.phys_addr(), PAGE_SIZE as usize).unwrap();
             let page_vaddr = pte.vaddrs.start;
             assert_eq!(guest_slice.len(), PAGE_SIZE as usize);
-            let slice_start = if page_vaddr < guest_vaddr { (guest_vaddr-page_vaddr) as usize } else {0};
-            let num_copied = guest_slice.subslice(slice_start, guest_slice.len()-slice_start).unwrap().copy_to(&mut buffer[num_bytes..]);
+            let slice_start = if page_vaddr < guest_vaddr {
+                (guest_vaddr - page_vaddr) as usize
+            } else {
+                0
+            };
+            let num_copied = guest_slice
+                .subslice(slice_start, guest_slice.len() - slice_start)
+                .unwrap()
+                .copy_to(&mut buffer[num_bytes..]);
             num_bytes += num_copied;
             if num_bytes >= buffer.len() {
                 break;
@@ -714,9 +750,15 @@ impl<GetMemT> NyxMemExtension for GetMemT where GetMemT: GetMem{
             let guest_slice = mem.get_slice(pte.phys_addr(), PAGE_SIZE as usize).unwrap();
             let page_vaddr = pte.vaddrs.start;
             assert_eq!(guest_slice.len(), PAGE_SIZE as usize);
-            let slice_start = if page_vaddr < guest_vaddr { (guest_vaddr-page_vaddr) as usize } else {0};
+            let slice_start = if page_vaddr < guest_vaddr {
+                (guest_vaddr - page_vaddr) as usize
+            } else {
+                0
+            };
             let buff_slice = &buffer[num_bytes..];
-            let guest_slice = guest_slice.subslice(slice_start, guest_slice.len()-slice_start).unwrap();
+            let guest_slice = guest_slice
+                .subslice(slice_start, guest_slice.len() - slice_start)
+                .unwrap();
             guest_slice.copy_from(buff_slice);
             let num_copied = buff_slice.len().min(guest_slice.len());
             num_bytes += num_copied;
@@ -727,7 +769,7 @@ impl<GetMemT> NyxMemExtension for GetMemT where GetMemT: GetMem{
         return Ok(num_bytes);
     }
 
-    fn set_physical_page_permission(&mut self, paddr: u64, perm: PagePermission){
+    fn set_physical_page_permission(&mut self, paddr: u64, perm: PagePermission) {
         let page_addr = paddr & M_PAGE_ALIGN;
         let region = self.get_mem().find_region(GuestAddress(page_addr)).unwrap();
         assert!(region.to_region_addr(GuestAddress(page_addr)).is_some());
@@ -738,15 +780,15 @@ impl<GetMemT> NyxMemExtension for GetMemT where GetMemT: GetMem{
             PagePermission::W => PROT_WRITE,
             PagePermission::RW => PROT_READ | PROT_WRITE,
         };
-        unsafe{
+        unsafe {
             let ptr = region.as_ptr().offset(offset as isize);
             mprotect(ptr as *mut c_void, PAGE_SIZE as usize, prot);
         }
     }
-    
+
     fn set_virtual_page_permission(&mut self, cr3: u64, vaddr: u64, perm: PagePermission) {
-       let phys_addr = self.resolve_vaddr(cr3, vaddr).unwrap();
-       self.set_physical_page_permission(phys_addr.0, perm);
+        let phys_addr = self.resolve_vaddr(cr3, vaddr).unwrap();
+        self.set_physical_page_permission(phys_addr.0, perm);
     }
 }
 
@@ -1016,14 +1058,14 @@ impl<'mem, BaseIter: Iterator<Item = PTE>> Iterator for MergedPTEWalker<'mem, Ba
     }
 }
 
-pub struct VirtSpace<'vm>{
+pub struct VirtSpace<'vm> {
     pub cr3: u64,
     pub vmm: &'vm Vmm,
     pub addr: u64,
 }
 
 // currently not a stable feature.
-fn checked_sub_signed(x: u64, y: i64) -> Option<u64>{
+fn checked_sub_signed(x: u64, y: i64) -> Option<u64> {
     return x.checked_sub(y as u64);
 }
 
@@ -1031,18 +1073,24 @@ impl<'vm> Seek for VirtSpace<'vm> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match pos {
             SeekFrom::Start(offset) => self.addr = offset,
-            SeekFrom::Current(offset) => {
-                match self.addr.checked_add_signed(offset){
-                    Some(new) => self.addr = new,
-                    None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Offset caused address Over/Underflow"))
+            SeekFrom::Current(offset) => match self.addr.checked_add_signed(offset) {
+                Some(new) => self.addr = new,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Offset caused address Over/Underflow",
+                    ));
                 }
-            }
-            SeekFrom::End(offset) => {
-                match checked_sub_signed(u64::MAX, offset){
-                    Some(new) => self.addr = new,
-                    None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Offset caused address Over/Underflow"))
+            },
+            SeekFrom::End(offset) => match checked_sub_signed(u64::MAX, offset) {
+                Some(new) => self.addr = new,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Offset caused address Over/Underflow",
+                    ));
                 }
-            }
+            },
         }
         Ok(self.addr)
     }
@@ -1077,9 +1125,6 @@ impl<'vm> Write for VirtSpace<'vm> {
         Ok(()) // No-op for in-memory buffer
     }
 }
-
-
-
 
 pub struct VirtMappedRange {
     cr3: u64,

@@ -1,12 +1,12 @@
+pub use iced_x86::OpAccess;
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, InstructionInfoFactory,
     NasmFormatter,
 };
-pub use iced_x86::OpAccess;
 const HEXBYTES_COLUMN_BYTE_LENGTH: usize = 10;
 
 // slightly modifed from the iced_x86 example - note this function is incredibly poorly done from a performance perspective!
-pub fn disassemble(addr: u64, bytes:&[u8]) -> Vec<String>{
+pub fn disassemble(addr: u64, bytes: &[u8]) -> Vec<String> {
     let wordsize = 64;
     let mut decoder = Decoder::with_ip(wordsize, bytes, addr, DecoderOptions::NONE);
 
@@ -18,7 +18,6 @@ pub fn disassemble(addr: u64, bytes:&[u8]) -> Vec<String>{
     // Change some options, there are many more
     formatter.options_mut().set_digit_separator("`");
     formatter.options_mut().set_first_operand_char_index(10);
-
 
     // Initialize this outside the loop because decode_out() writes to every field
     let mut instruction = Instruction::default();
@@ -57,12 +56,10 @@ pub fn disassemble(addr: u64, bytes:&[u8]) -> Vec<String>{
 }
 
 pub fn disassemble_print(addr: u64, bytes: &[u8]) {
-    for line in disassemble(addr, bytes){
+    for line in disassemble(addr, bytes) {
         println!("{}", line);
     }
 }
-
-
 
 use iced_x86::Register;
 use kvm_bindings::{kvm_regs, kvm_sregs};
@@ -158,12 +155,16 @@ fn get_register_value(reg: Register, regs: &kvm_regs, sregs: &kvm_sregs) -> u64 
         Register::GS => sregs.gs.base,
 
         // Default case for unsupported registers
-        reg => panic!("unhandled memory access with register {:?}",reg),
+        reg => panic!("unhandled memory access with register {:?}", reg),
     }
 }
 
 // Assume this exists in your code
-pub fn get_memory_accesses(instr: &Instruction, regs: &kvm_regs, sregs: &kvm_sregs) -> Vec<(u64, OpAccess)> {
+pub fn get_memory_accesses(
+    instr: &Instruction,
+    regs: &kvm_regs,
+    sregs: &kvm_sregs,
+) -> Vec<(u64, OpAccess)> {
     let mut factory = InstructionInfoFactory::new();
     let info = factory.info(instr);
     let page_size = crate::mem::PAGE_SIZE;
@@ -194,15 +195,19 @@ pub fn get_memory_accesses(instr: &Instruction, regs: &kvm_regs, sregs: &kvm_sre
     accesses
 }
 
-pub fn disassemble_memory_accesses(data: &[u8], regs: &kvm_regs, sregs: &kvm_sregs) -> Vec<(u64, OpAccess)> {
+pub fn disassemble_memory_accesses(
+    data: &[u8],
+    regs: &kvm_regs,
+    sregs: &kvm_sregs,
+) -> Vec<(u64, OpAccess)> {
     let mut decoder = Decoder::with_ip(64, data, regs.rip, DecoderOptions::NONE);
     let mut instruction = Instruction::default();
     if decoder.can_decode() {
         decoder.decode_out(&mut instruction);
     } else {
-        return vec![]; 
+        return vec![];
     }
-    return get_memory_accesses(&instruction, regs, sregs)
+    return get_memory_accesses(&instruction, regs, sregs);
 }
 
 pub fn is_control_flow(addr: u64, bytes: &[u8]) -> bool {
