@@ -4,4 +4,4 @@
 	branch = nyx-patches
 [submodule "test-binaries"]
 	path = test-binaries
-	url = git@github.com:nyx-fuzz/nyx-lite-test-binaries.git
+	url = https://github.com/nyx-fuzz/nyx-lite-test-binaries.git

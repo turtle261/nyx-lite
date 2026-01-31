@@ -2,26 +2,19 @@
 name = "nyx-lite"
 version = "0.1.0"
 edition = "2024"
-
-[workspace]
-members = [
-  ".",
-  "vendor/linux-loader",
-]
-resolver = "3"
-
-[workspace.lints.rust]
-warnings = "warn"
-
-[workspace.lints.clippy]
-all = "warn"
+license = "Apache-2.0"
+description = "Lightweight Firecracker-based VM runtime for InfoTheory experiments."
+repository = "https://github.com/turtle261/nyx-lite"
+homepage = "https://infotheory.tech"
+documentation = "https://docs.rs/nyx-lite"
+publish = false
 
 [dependencies]
 #firecracker = { git = "https://github.com/firecracker-microvm/firecracker" }
-firecracker = { path = "./vendor/firecracker-nyx-patches/src/firecracker"}
-vmm = { path = "./vendor/firecracker-nyx-patches/src/vmm"}
-utils= { path = "./vendor/firecracker-nyx-patches/src/utils" }
-seccompiler= { path = "./vendor/firecracker-nyx-patches/src/seccompiler"}
+firecracker = { path = "./vendor/firecracker-nyx-patches/src/firecracker" }
+vmm = { path = "./vendor/firecracker-nyx-patches/src/vmm" }
+utils = { path = "./vendor/firecracker-nyx-patches/src/utils" }
+seccompiler = { path = "./vendor/firecracker-nyx-patches/src/seccompiler" }
 event-manager = "0.4.2"
 libc = "0.2.155"
 anyhow ="1.0.86"
