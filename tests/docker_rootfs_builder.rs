@@ -78,7 +78,10 @@ fn docker_rootfs_builder_smoke_test() {
 
     let md = fs::metadata(&out_img).expect("rootfs image should exist");
     assert!(md.len() > 0, "rootfs image should be non-empty");
-    assert!(ext4_has_magic(&out_img), "rootfs image should look like ext4");
+    assert!(
+        ext4_has_magic(&out_img),
+        "rootfs image should look like ext4"
+    );
 
     // Cleanup best-effort.
     let _ = fs::remove_file(&out_img);
