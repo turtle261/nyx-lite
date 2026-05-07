@@ -12,3 +12,6 @@ examples/test_*
 # Added by cargo
 
 /target
+
+vm_image/vmconfig_abs.json
+vm_image/vmconfig_initramfs.json

@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TARGET_TRIPLE=x86_64-unknown-linux-musl
 GUEST_TEST_PATH="${SCRIPT_DIR}/../../test-binaries/target/${TARGET_TRIPLE}/release/guest_test"
 RESOURCES_DIR="${SCRIPT_DIR}/resources"
-PATH="/home/theo/.cargo/bin/:$PATH"
+PATH="$HOME/.cargo/bin:$PATH"
 
 if [ -n "${GUEST_TEST_BIN:-}" ]; then
   rm -f "${RESOURCES_DIR}/guest_test"
